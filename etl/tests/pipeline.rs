@@ -1023,7 +1023,9 @@ async fn table_empty_table_transitions_to_ready() {
 
     pipeline.start().await.unwrap();
 
-    timeout(Duration::from_secs(5), empty_state_notify.notified()).await.expect("Waiting for tables to turn Ready timed out");
+    timeout(Duration::from_secs(5), empty_state_notify.notified())
+        .await
+        .expect("Waiting for tables to turn Ready timed out");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1055,5 +1057,7 @@ async fn table_non_empty_table_transitions_to_ready() {
 
     pipeline.start().await.unwrap();
 
-    timeout(Duration::from_secs(5), user_state_notify.notified()).await.expect("Waiting for tables to turn Ready timed out");
+    timeout(Duration::from_secs(5), user_state_notify.notified())
+        .await
+        .expect("Waiting for tables to turn Ready timed out");
 }

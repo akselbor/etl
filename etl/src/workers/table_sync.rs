@@ -652,11 +652,6 @@ where
 
         // If the apply loop was completed, we perform cleanup since resources are not needed anymore.
         if let ApplyLoopResult::Completed = result {
-            // Once the apply loop is completed, we mark the table as ready. If we don't do that here,
-            // it will remain locked as "SyncDone" if the table has no data, as the apply loop is skipped.
-            self.store
-                .update_table_replication_state(self.table_id, TableReplicationPhase::Ready)
-                .await?;
             // We delete the replication slot used by this table sync worker.
             //
             // Note that if the deletion fails, the slot will remain in the database and will not be
@@ -840,7 +835,17 @@ where
     async fn before_loop(&self, start_lsn: PgLsn) -> EtlResult<ApplyLoopAction> {
         info!("checking if the table sync worker is already caught up with the apply worker");
 
-        self.try_advance_phase(start_lsn, true).await
+        let result = self.try_advance_phase(start_lsn, true).await?;
+
+        // If the table worker is already complete before starting, we mark the table as ready. If we don't do that here,
+        // it will remain locked as "SyncDone" if the table has no data.
+        if let ApplyLoopAction::Complete = result {
+            self.state_store
+                .update_table_replication_state(self.table_id, TableReplicationPhase::Ready)
+                .await?;
+        }
+
+        Ok(result)
     }
 
     /// This function compares `current_lsn` against the table's catch up lsn
