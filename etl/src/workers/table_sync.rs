@@ -644,7 +644,7 @@ where
             replication_client.clone(),
             self.store.clone(),
             self.destination,
-            TableSyncWorkerHook::new(self.table_id, state, self.store),
+            TableSyncWorkerHook::new(self.table_id, state, self.store.clone()),
             self.shutdown_rx,
             None,
         )
@@ -652,6 +652,11 @@ where
 
         // If the apply loop was completed, we perform cleanup since resources are not needed anymore.
         if let ApplyLoopResult::Completed = result {
+            // Once the apply loop is completed, we mark the table as ready. If we don't do that here,
+            // it will remain locked as "SyncDone" if the table has no data, as the apply loop is skipped.
+            self.store
+                .update_table_replication_state(self.table_id, TableReplicationPhase::Ready)
+                .await?;
             // We delete the replication slot used by this table sync worker.
             //
             // Note that if the deletion fails, the slot will remain in the database and will not be
