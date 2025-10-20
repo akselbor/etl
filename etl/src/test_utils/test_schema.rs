@@ -10,15 +10,17 @@ use crate::types::{Cell, Event, InsertEvent, TableRow};
 
 #[derive(Debug, Clone, Copy)]
 pub enum TableSelection {
-    Both,
+    All,
     UsersOnly,
     OrdersOnly,
+    EmptyOnly,
 }
 
 #[derive(Debug)]
 pub struct TestDatabaseSchema {
     users_table_schema: Option<TableSchema>,
     orders_table_schema: Option<TableSchema>,
+    empty_table_schema: Option<TableSchema>,
     publication_name: String,
 }
 
@@ -38,6 +40,12 @@ impl TestDatabaseSchema {
             .clone()
             .expect("Orders table schema not found")
     }
+
+    pub fn empty_schema(&self) -> TableSchema {
+        self.empty_table_schema
+            .clone()
+            .expect("Empty table schema not found")
+    }
 }
 
 pub async fn setup_test_database_schema<G: GenericClient>(
@@ -47,8 +55,9 @@ pub async fn setup_test_database_schema<G: GenericClient>(
     let mut tables_to_publish = Vec::new();
     let mut users_table_schema = None;
     let mut orders_table_schema = None;
+    let mut empty_table_schema = None;
 
-    if matches!(selection, TableSelection::Both | TableSelection::UsersOnly) {
+    if matches!(selection, TableSelection::All | TableSelection::UsersOnly) {
         let users_table_name = test_table_name("users");
         let users_table_id = database
             .create_table(
@@ -84,7 +93,7 @@ pub async fn setup_test_database_schema<G: GenericClient>(
         ));
     }
 
-    if matches!(selection, TableSelection::Both | TableSelection::OrdersOnly) {
+    if matches!(selection, TableSelection::All | TableSelection::OrdersOnly) {
         let orders_table_name = test_table_name("orders");
         let orders_table_id = database
             .create_table(
@@ -113,6 +122,35 @@ pub async fn setup_test_database_schema<G: GenericClient>(
         ));
     }
 
+    if matches!(selection, TableSelection::All | TableSelection::EmptyOnly) {
+        let empty_table_name = test_table_name("empty");
+        let empty_table_id = database
+            .create_table(
+                empty_table_name.clone(),
+                true,
+                &[("dummy", "text not null")],
+            )
+            .await
+            .expect("Failed to create empty table");
+
+        tables_to_publish.push(empty_table_name.clone());
+
+        empty_table_schema = Some(TableSchema::new(
+            empty_table_id,
+            empty_table_name,
+            vec![
+                id_column_schema(),
+                ColumnSchema {
+                    name: "dummy".to_string(),
+                    typ: Type::TEXT,
+                    modifier: -1,
+                    nullable: false,
+                    primary: false,
+                },
+            ],
+        ));
+    }
+
     // Create publication for selected tables
     let publication_name = "test_pub";
     database
@@ -123,6 +161,7 @@ pub async fn setup_test_database_schema<G: GenericClient>(
     TestDatabaseSchema {
         users_table_schema,
         orders_table_schema,
+        empty_table_schema,
         publication_name: publication_name.to_owned(),
     }
 }

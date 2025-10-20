@@ -31,7 +31,7 @@ async fn table_copy_and_streaming_with_restart() {
     install_crypto_provider();
 
     let mut database = spawn_source_database().await;
-    let database_schema = setup_test_database_schema(&database, TableSelection::Both).await;
+    let database_schema = setup_test_database_schema(&database, TableSelection::All).await;
 
     let bigquery_database = setup_bigquery_connection().await;
 
@@ -378,7 +378,7 @@ async fn table_truncate_with_batching() {
     install_crypto_provider();
 
     let mut database = spawn_source_database().await;
-    let database_schema = setup_test_database_schema(&database, TableSelection::Both).await;
+    let database_schema = setup_test_database_schema(&database, TableSelection::All).await;
 
     let bigquery_database = setup_bigquery_connection().await;
 

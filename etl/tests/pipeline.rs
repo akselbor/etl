@@ -20,13 +20,13 @@ use etl_postgres::tokio::test_utils::TableModification;
 use etl_telemetry::tracing::init_test_tracing;
 use rand::random;
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn table_schema_copy_survives_pipeline_restarts() {
     init_test_tracing();
     let mut database = spawn_source_database().await;
-    let database_schema = setup_test_database_schema(&database, TableSelection::Both).await;
+    let database_schema = setup_test_database_schema(&database, TableSelection::All).await;
 
     let store = NotifyingStore::new();
     let destination = TestDestinationWrapper::wrap(MemoryDestination::new());
@@ -45,13 +45,13 @@ async fn table_schema_copy_survives_pipeline_restarts() {
     let users_state_notify = store
         .notify_on_table_state_type(
             database_schema.users_schema().id,
-            TableReplicationPhaseType::SyncDone,
+            TableReplicationPhaseType::Ready,
         )
         .await;
     let orders_state_notify = store
         .notify_on_table_state_type(
             database_schema.orders_schema().id,
-            TableReplicationPhaseType::SyncDone,
+            TableReplicationPhaseType::Ready,
         )
         .await;
 
@@ -64,25 +64,25 @@ async fn table_schema_copy_survives_pipeline_restarts() {
 
     // We check that the states are correctly set.
     let table_replication_states = store.get_table_replication_states().await;
-    assert_eq!(table_replication_states.len(), 2);
+    assert_eq!(table_replication_states.len(), 3);
     assert_eq!(
         table_replication_states
             .get(&database_schema.users_schema().id)
             .unwrap()
             .as_type(),
-        TableReplicationPhaseType::SyncDone
+        TableReplicationPhaseType::Ready
     );
     assert_eq!(
         table_replication_states
             .get(&database_schema.orders_schema().id)
             .unwrap()
             .as_type(),
-        TableReplicationPhaseType::SyncDone
+        TableReplicationPhaseType::Ready
     );
 
     // We check that the table schemas have been stored.
     let table_schemas = store.get_table_schemas().await;
-    assert_eq!(table_schemas.len(), 2);
+    assert_eq!(table_schemas.len(), 3);
     assert_eq!(
         *table_schemas
             .get(&database_schema.users_schema().id)
@@ -406,7 +406,7 @@ async fn publication_for_all_tables_in_schema_ignores_new_tables_until_restart()
 async fn table_copy_replicates_existing_data() {
     init_test_tracing();
     let mut database = spawn_source_database().await;
-    let database_schema = setup_test_database_schema(&database, TableSelection::Both).await;
+    let database_schema = setup_test_database_schema(&database, TableSelection::All).await;
 
     // Insert initial test data.
     let rows_inserted = 10;
@@ -493,7 +493,7 @@ async fn table_copy_replicates_existing_data() {
 async fn table_copy_and_sync_streams_new_data() {
     init_test_tracing();
     let mut database = spawn_source_database().await;
-    let database_schema = setup_test_database_schema(&database, TableSelection::Both).await;
+    let database_schema = setup_test_database_schema(&database, TableSelection::All).await;
 
     // Insert initial test data.
     let rows_inserted = 10;
@@ -992,4 +992,68 @@ async fn table_without_primary_key_is_errored() {
     // We expect no events to be saved.
     let events = destination.get_events().await;
     assert!(events.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn table_empty_table_transitions_to_ready() {
+    init_test_tracing();
+    let database = spawn_source_database().await;
+    let database_schema = setup_test_database_schema(&database, TableSelection::EmptyOnly).await;
+
+    let store = NotifyingStore::new();
+    let destination = TestDestinationWrapper::wrap(MemoryDestination::new());
+
+    // We start the pipeline from scratch.
+    let pipeline_id: PipelineId = random();
+    let mut pipeline = create_pipeline(
+        &database.config,
+        pipeline_id,
+        database_schema.publication_name(),
+        store.clone(),
+        destination.clone(),
+    );
+
+    // We wait for both table states to be in sync done.
+    let empty_state_notify = store
+        .notify_on_table_state_type(
+            database_schema.empty_schema().id,
+            TableReplicationPhaseType::Ready,
+        )
+        .await;
+
+    pipeline.start().await.unwrap();
+
+    timeout(Duration::from_secs(5), empty_state_notify.notified()).await.expect("Waiting for tables to turn Ready timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn table_non_empty_table_transitions_to_ready() {
+    init_test_tracing();
+    let database = spawn_source_database().await;
+    let database_schema = setup_test_database_schema(&database, TableSelection::UsersOnly).await;
+
+    let store = NotifyingStore::new();
+    let destination = TestDestinationWrapper::wrap(MemoryDestination::new());
+
+    // We start the pipeline from scratch.
+    let pipeline_id: PipelineId = random();
+    let mut pipeline = create_pipeline(
+        &database.config,
+        pipeline_id,
+        database_schema.publication_name(),
+        store.clone(),
+        destination.clone(),
+    );
+
+    // We wait for both table states to be in sync done.
+    let user_state_notify = store
+        .notify_on_table_state_type(
+            database_schema.users_schema().id,
+            TableReplicationPhaseType::Ready,
+        )
+        .await;
+
+    pipeline.start().await.unwrap();
+
+    timeout(Duration::from_secs(5), user_state_notify.notified()).await.expect("Waiting for tables to turn Ready timed out");
 }

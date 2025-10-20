@@ -23,7 +23,7 @@ async fn table_copy() {
     init_test_tracing();
 
     let mut database = spawn_source_database().await;
-    let database_schema = setup_test_database_schema(&database, TableSelection::Both).await;
+    let database_schema = setup_test_database_schema(&database, TableSelection::All).await;
 
     // Insert initial test data.
     insert_mock_data(
@@ -157,7 +157,7 @@ async fn cdc_streaming() {
     init_test_tracing();
 
     let mut database = spawn_source_database().await;
-    let database_schema = setup_test_database_schema(&database, TableSelection::Both).await;
+    let database_schema = setup_test_database_schema(&database, TableSelection::All).await;
 
     let store = NotifyingStore::new();
     let pipeline_id: PipelineId = random();
@@ -435,7 +435,7 @@ async fn cdc_streaming_with_truncate() {
     init_test_tracing();
 
     let mut database = spawn_source_database().await;
-    let database_schema = setup_test_database_schema(&database, TableSelection::Both).await;
+    let database_schema = setup_test_database_schema(&database, TableSelection::All).await;
 
     let store = NotifyingStore::new();
     let pipeline_id: PipelineId = random();
