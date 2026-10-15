@@ -11,9 +11,9 @@ use etl::{
         DropTableForCopyResult, TableCopyBatchId, WriteEventsDurability, WriteEventsResult,
         WriteTableRowsResult,
     },
-    error::{ErrorKind, EtlError, EtlResult},
+    error::{ErrorKind, EtlError, EtlResult, Retryability},
     etl_error,
-    event::{Event, EventSequenceKey},
+    event::{Event, EventPosition},
     schema::{
         ColumnAlterationKind, ColumnMetadataChange, ColumnPresenceChangeReason, ColumnSchema,
         IdentityType, PgLsn, ReplicatedTableSchema, SchemaDiff, SchemaOperation, SchemaPlan,
@@ -82,7 +82,7 @@ struct PendingRow {
     /// Source ordering for this DML event. MergeTree exposes the LSN and
     /// transaction ordinal separately; ReplacingMergeTree stores the packed
     /// key in `_etl_version`.
-    sequence_key: EventSequenceKey,
+    event_position: EventPosition,
     /// User column values in source schema order. The trailing CDC columns are
     /// appended at encode time and are not present here.
     cells: Vec<Cell>,
@@ -111,22 +111,22 @@ fn cdc_lsn_to_clickhouse_value(lsn: PgLsn) -> ClickHouseValue {
 ///
 /// MergeTree: `cdc_operation` (String), `cdc_lsn` (UInt64 commit LSN), and
 /// `cdc_tx_ordinal` (UInt64 transaction ordinal). ReplacingMergeTree:
-/// `_etl_version` (UInt128 packed `EventSequenceKey`) and `_etl_deleted` (UInt8
+/// `_etl_version` (UInt128 packed `EventPosition`) and `_etl_deleted` (UInt8
 /// tombstone flag).
 fn append_cdc_columns(
     values: &mut Vec<ClickHouseValue>,
     operation: CdcOperation,
-    sequence_key: EventSequenceKey,
+    event_position: EventPosition,
     engine: ClickHouseEngine,
 ) {
     match engine {
         ClickHouseEngine::MergeTree => {
             values.push(ClickHouseValue::String(operation.to_string()));
-            values.push(cdc_lsn_to_clickhouse_value(sequence_key.commit_lsn));
-            values.push(ClickHouseValue::UInt64(sequence_key.tx_ordinal));
+            values.push(cdc_lsn_to_clickhouse_value(event_position.commit_lsn));
+            values.push(ClickHouseValue::UInt64(event_position.tx_ordinal));
         }
         ClickHouseEngine::ReplacingMergeTree => {
-            let version = sequence_key.as_u128();
+            let version = event_position.as_u128();
             values.push(ClickHouseValue::UInt128(version));
             values
                 .push(ClickHouseValue::UInt8(u8::from(matches!(operation, CdcOperation::Delete))));
@@ -193,49 +193,28 @@ fn ensure_clickhouse_renames_are_supported(table_name: &str, plan: &SchemaPlan) 
 ///
 /// A column newly exposed by the replication mask has no destination values for
 /// historical rows. ClickHouse scalars therefore use `Nullable(T)` without the
-/// source default. ClickHouse cannot represent a top-level nullable array, so a
-/// replication-mask expansion containing an array fails instead of silently
-/// exposing empty arrays for historical rows.
+/// source default. Arrays cannot be `Nullable`, so historical rows read as
+/// empty arrays, the same value a top-level `NULL` array is stored as.
 fn clickhouse_add_column_definition(
-    table_name: &str,
     after_column_schema: &ColumnSchema,
     reason: ColumnPresenceChangeReason,
-) -> EtlResult<(ColumnSchema, bool)> {
+) -> (ColumnSchema, bool) {
     let mut destination_column_schema = after_column_schema.clone();
     if reason == ColumnPresenceChangeReason::ReplicationMask {
-        if is_array_type(&after_column_schema.typ) {
-            return Err(etl_error!(
-                ErrorKind::SourceSchemaError,
-                "ClickHouse cannot add a publication array column as nullable",
-                format!(
-                    "Table '{table_name}' column '{}' entered the replication mask, but \
-                     ClickHouse does not support Nullable(Array(...)). Resynchronize the table \
-                     with the column included from initial copy.",
-                    after_column_schema.name,
-                )
-            ));
-        }
-
         destination_column_schema.default_expression = None;
-        return Ok((destination_column_schema, true));
+        return (destination_column_schema, true);
     }
 
     let preserve_not_null = !after_column_schema.nullable
         && after_column_schema.default_expression.as_deref().is_some_and(|default_expression| {
             supports_column_default(default_expression, &after_column_schema.typ)
         });
-    Ok((destination_column_schema, !preserve_not_null))
+    (destination_column_schema, !preserve_not_null)
 }
 
-/// Validates add-column policies before any ordered ClickHouse DDL executes.
-fn ensure_clickhouse_additions_are_supported(table_name: &str, plan: &SchemaPlan) -> EtlResult<()> {
-    for operation in plan.ordered_operations() {
-        if let SchemaOperation::AddColumn { after_column_schema, reason } = operation {
-            clickhouse_add_column_definition(table_name, after_column_schema, *reason)?;
-        }
-    }
-
-    Ok(())
+/// Returns whether `typ` holds wall-clock timestamps without a time zone.
+fn is_wall_clock_timestamp(typ: &Type) -> bool {
+    matches!(*typ, Type::TIMESTAMP | Type::TIMESTAMP_ARRAY)
 }
 
 /// Rejects source type changes that change the mapped ClickHouse type before
@@ -247,6 +226,10 @@ fn ensure_clickhouse_additions_are_supported(table_name: &str, plan: &SchemaPlan
 /// source. Writing new rows into the old column would instead reinterpret
 /// RowBinary bytes or fail every insert. Changes that keep the mapped type,
 /// such as `varchar(50)` to `varchar(100)`, need no DDL and are accepted.
+///
+/// `timestamp` and `timestamptz` share a ClickHouse type, but a change between
+/// them is still rejected: Postgres converts existing values through the
+/// session time zone, so stored ClickHouse rows would no longer match.
 fn ensure_clickhouse_type_changes_are_supported(
     table_name: &str,
     plan: &SchemaPlan,
@@ -272,6 +255,20 @@ fn ensure_clickhouse_type_changes_are_supported(
                 format!(
                     "Table '{table_name}' changes column '{}' from {} to {}, which changes its \
                      ClickHouse type from '{before_type}' to '{after_type}'. ETL does not convert \
+                     existing ClickHouse rows. Resynchronize the table.",
+                    after.name,
+                    before.typ.name(),
+                    after.typ.name(),
+                )
+            ));
+        }
+        if is_wall_clock_timestamp(&before.typ) != is_wall_clock_timestamp(&after.typ) {
+            return Err(etl_error!(
+                ErrorKind::SourceSchemaError,
+                "ClickHouse cannot apply a source column type change",
+                format!(
+                    "Table '{table_name}' changes column '{}' from {} to {}. Postgres converts \
+                     existing values through the session time zone, and ETL does not convert \
                      existing ClickHouse rows. Resynchronize the table.",
                     after.name,
                     before.typ.name(),
@@ -658,7 +655,8 @@ impl Default for ClickHouseClientConfig {
 ///
 /// Used to:
 /// - select the corresponding server-side budget,
-/// - map a generic clickhouse error onto the appropriate [`ErrorKind`].
+/// - name what failed when a generic clickhouse error maps onto an
+///   [`ErrorKind`].
 #[derive(Copy, Clone)]
 pub(crate) enum ClickHouseOperationKind {
     /// Connectivity check (`SELECT 1`).
@@ -674,13 +672,15 @@ pub(crate) enum ClickHouseOperationKind {
 impl ClickHouseOperationKind {
     /// Error kind used when the inner future returns a
     /// `clickhouse::error::Error`.
+    ///
+    /// The kind names what failed. Whether a retry can succeed comes from the
+    /// error itself.
     pub(crate) fn failed_kind(self) -> ErrorKind {
         match self {
             ClickHouseOperationKind::ConnectivityCheck => ErrorKind::DestinationConnectionFailed,
-            ClickHouseOperationKind::SchemaQuery | ClickHouseOperationKind::Ddl => {
-                ErrorKind::DestinationQueryFailed
-            }
-            ClickHouseOperationKind::Insert => ErrorKind::DestinationAtomicBatchRetryable,
+            ClickHouseOperationKind::SchemaQuery
+            | ClickHouseOperationKind::Ddl
+            | ClickHouseOperationKind::Insert => ErrorKind::DestinationQueryFailed,
         }
     }
 }
@@ -743,24 +743,31 @@ struct ClickHouseTableCacheEntry {
 /// That happens when the table changed after the layout was loaded, for
 /// example through an external `ALTER`. Evicting makes the next write reload
 /// and check the table, which reports the drift as `CorruptedTableSchema`
-/// instead of retrying the same rejected header. Other failures, such as
-/// timeouts and network errors, keep the layout so a retry needs no extra
-/// schema query. The entry is removed only while it still holds `layout`, so a
-/// failed insert cannot evict a layout that a concurrent writer already
-/// reloaded.
+/// instead of retrying the same rejected header, so the rejection becomes
+/// retryable. Other failures, such as timeouts and network errors, keep the
+/// layout so a retry needs no extra schema query. The entry is removed only
+/// while it still holds `layout`, so a failed insert cannot evict a layout that
+/// a concurrent writer already reloaded.
 fn evict_layout_after_rejected_insert(
     table_cache: &RwLock<HashMap<TableId, Arc<ClickHouseTableCacheEntry>>>,
     table_id: TableId,
     layout: &Arc<RowBinaryLayout>,
     failure: InsertRowsError,
 ) -> EtlError {
-    if failure.is_layout_rejection() {
+    if !failure.is_layout_rejection() {
+        return failure.into();
+    }
+
+    {
         let mut guard = table_cache.write();
         if guard.get(&table_id).is_some_and(|entry| Arc::ptr_eq(&entry.layout, layout)) {
             guard.remove(&table_id);
         }
     }
-    failure.into()
+
+    // ClickHouse rejects the stale header on every resend, but the next
+    // attempt loads the current layout, so a retry makes progress.
+    EtlError::from(failure).with_retryability(Retryability::Retryable)
 }
 
 /// Execution context captured by ClickHouse background event tasks.
@@ -898,34 +905,9 @@ impl EventBatchFences {
 
         let mut guards = Vec::with_capacity(fences.len());
         for fence in fences {
-            #[cfg(feature = "test-utils")]
-            if fence.try_lock().is_err() {
-                notify_fence_wait_for_tests();
-            }
             guards.push(fence.lock_owned().await);
         }
         guards
-    }
-}
-
-/// Tests waiting to hear that a batch dispatch had to wait for a fence.
-#[cfg(feature = "test-utils")]
-static FENCE_WAIT_OBSERVERS: Mutex<Vec<tokio::sync::oneshot::Sender<()>>> = Mutex::new(Vec::new());
-
-/// Returns a receiver that fires the next time a batch dispatch has to wait
-/// for a fence held by an earlier batch. Each receiver fires once.
-#[cfg(feature = "test-utils")]
-pub fn notify_on_fence_wait_for_tests() -> tokio::sync::oneshot::Receiver<()> {
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    FENCE_WAIT_OBSERVERS.lock().push(sender);
-    receiver
-}
-
-/// Fires every armed fence-wait observer.
-#[cfg(feature = "test-utils")]
-fn notify_fence_wait_for_tests() {
-    for observer in FENCE_WAIT_OBSERVERS.lock().drain(..) {
-        let _ = observer.send(());
     }
 }
 
@@ -1485,7 +1467,7 @@ where
                 append_cdc_columns(
                     &mut values,
                     CdcOperation::Insert,
-                    EventSequenceKey::new(PgLsn::from(0), 0),
+                    EventPosition::new(PgLsn::from(0), 0),
                     engine,
                 );
                 Ok(values)
@@ -1537,7 +1519,7 @@ where
 
         // A relation event identifies the exact target schema through its
         // snapshot ID and replication mask. It can therefore resume an
-        // interrupted change without inventing a DML event sequence key.
+        // interrupted change without inventing a DML event position.
         if metadata.is_pending() {
             let clickhouse_table_name = metadata.table_id().to_owned();
             self.recover_pending_metadata(table_id, &clickhouse_table_name, new_schema, metadata)
@@ -1600,7 +1582,6 @@ where
         let clickhouse_table_name = metadata.table_id();
         let plan = current_schema.plan_schema_change(new_schema, CLICKHOUSE_COLUMN_NAME_MAPPING)?;
         ensure_clickhouse_renames_are_supported(clickhouse_table_name, &plan)?;
-        ensure_clickhouse_additions_are_supported(clickhouse_table_name, &plan)?;
         ensure_clickhouse_type_changes_are_supported(clickhouse_table_name, &plan)?;
         if matches!(self.inserter_config.engine, ClickHouseEngine::ReplacingMergeTree) {
             reject_pk_alters_under_replacing_merge_tree(
@@ -1681,7 +1662,6 @@ where
     ) -> EtlResult<()> {
         let is_replacing_merge_tree =
             matches!(self.inserter_config.engine, ClickHouseEngine::ReplacingMergeTree);
-        ensure_clickhouse_additions_are_supported(clickhouse_table_name, plan)?;
         ensure_clickhouse_type_changes_are_supported(clickhouse_table_name, plan)?;
         if plan.is_empty() {
             if is_replacing_merge_tree {
@@ -1728,11 +1708,7 @@ where
                 }
                 SchemaOperation::AddColumn { after_column_schema, reason } => {
                     let (destination_column_schema, force_nullable) =
-                        clickhouse_add_column_definition(
-                            clickhouse_table_name,
-                            after_column_schema,
-                            *reason,
-                        )?;
+                        clickhouse_add_column_definition(after_column_schema, *reason);
                     if force_nullable
                         && !after_column_schema.nullable
                         && !is_array_type(&after_column_schema.typ)
@@ -1874,19 +1850,19 @@ where
                 };
                 match event {
                     Event::Insert(insert) => {
-                        let sequence_key = insert.event_sequence_key();
+                        let event_position = insert.event_position();
                         let table_id = insert.replicated_table_schema.id();
                         let entry = pending
                             .entry(table_id)
                             .or_insert_with(|| (insert.replicated_table_schema, Vec::new()));
                         entry.1.push(PendingRow {
                             operation: CdcOperation::Insert,
-                            sequence_key,
+                            event_position,
                             cells: insert.table_row.into_values(),
                         });
                     }
                     Event::Update(update) => {
-                        let sequence_key = update.event_sequence_key();
+                        let event_position = update.event_position();
                         let source_updated_row = update.updated_table_row;
                         let source_old_row = update.old_table_row;
                         let rows_for_update = clickhouse_rows_for_update(
@@ -1907,19 +1883,19 @@ where
                         {
                             entry.1.push(PendingRow {
                                 operation: CdcOperation::Delete,
-                                sequence_key,
+                                event_position,
                                 cells: destination_old_key_tombstone.into_values(),
                             });
                         }
 
                         entry.1.push(PendingRow {
                             operation: CdcOperation::Update,
-                            sequence_key,
+                            event_position,
                             cells: rows_for_update.destination_updated_row.into_values(),
                         });
                     }
                     Event::Delete(delete) => {
-                        let sequence_key = delete.event_sequence_key();
+                        let event_position = delete.event_position();
                         let source_old_row = clickhouse_delete_old_row(
                             &delete.replicated_table_schema,
                             delete.old_table_row,
@@ -1936,7 +1912,7 @@ where
                             .or_insert_with(|| (delete.replicated_table_schema, Vec::new()));
                         entry.1.push(PendingRow {
                             operation: CdcOperation::Delete,
-                            sequence_key,
+                            event_position,
                             cells: destination_old_row.into_values(),
                         });
                     }
@@ -2008,12 +1984,12 @@ where
             tasks.spawn(async move {
                 let rows: Vec<Vec<ClickHouseValue>> = rows
                     .into_iter()
-                    .map(|PendingRow { operation, sequence_key, cells }| {
+                    .map(|PendingRow { operation, event_position, cells }| {
                         let mut values: Vec<ClickHouseValue> = cells
                             .into_iter()
                             .map(cell_to_clickhouse_value)
                             .collect::<EtlResult<Vec<_>>>()?;
-                        append_cdc_columns(&mut values, operation, sequence_key, engine);
+                        append_cdc_columns(&mut values, operation, event_position, engine);
                         Ok(values)
                     })
                     .collect::<EtlResult<_>>()?;
@@ -2783,7 +2759,7 @@ mod tests {
 
     use super::*;
     use crate::clickhouse::{
-        encoding::encode_to_row_binary,
+        encoding::{ColumnEncoding, encode_to_row_binary},
         schema::{
             CDC_LSN_COLUMN_NAME, CDC_OPERATION_COLUMN_NAME, CDC_TX_ORDINAL_COLUMN_NAME,
             ETL_DELETED_COLUMN_NAME, ETL_VERSION_COLUMN_NAME, clickhouse_column_type,
@@ -2965,29 +2941,32 @@ mod tests {
             .with_default_expression("42".to_owned());
 
         let (destination_column, force_nullable) = clickhouse_add_column_definition(
-            "events",
             &source_column,
             ColumnPresenceChangeReason::ReplicationMask,
-        )
-        .unwrap();
+        );
 
         assert!(force_nullable);
         assert_eq!(destination_column.default_expression, None);
         assert_eq!(clickhouse_column_type(&destination_column, force_nullable), "Nullable(Int32)");
     }
 
+    /// A publication-added array has no historical values, so it is added
+    /// without the source default and old rows read as empty arrays.
     #[test]
-    fn replication_mask_array_addition_is_rejected() {
-        let source_column = ColumnSchema::new("scores".to_owned(), Type::INT4_ARRAY, -1, 1, false);
+    fn replication_mask_array_addition_is_a_non_nullable_array_without_default() {
+        let source_column = ColumnSchema::new("scores".to_owned(), Type::INT4_ARRAY, -1, 1, false)
+            .with_default_expression("'{1}'::integer[]".to_owned());
 
-        let error = clickhouse_add_column_definition(
-            "events",
+        let (destination_column, force_nullable) = clickhouse_add_column_definition(
             &source_column,
             ColumnPresenceChangeReason::ReplicationMask,
-        )
-        .unwrap_err();
+        );
 
-        assert_eq!(error.kind(), ErrorKind::SourceSchemaError);
+        assert_eq!(destination_column.default_expression, None);
+        assert_eq!(
+            clickhouse_column_type(&destination_column, force_nullable),
+            "Array(Nullable(Int32))"
+        );
     }
 
     #[test]
@@ -3449,8 +3428,9 @@ mod tests {
         assert!(error.to_string().contains("partial update row"));
     }
 
+    /// A full update row carrying a NULL array encodes as an empty array.
     #[test]
-    fn clickhouse_full_update_row_defers_null_array_failure_to_row_binary_encoding() {
+    fn clickhouse_full_update_row_encodes_null_array_as_empty_array() {
         // GIVEN: The replicated schema contains a nullable array column.
         let table_schema = Arc::new(TableSchema::new(
             TableId::new(1),
@@ -3459,26 +3439,23 @@ mod tests {
         ));
         let schema = ReplicatedTableSchema::all(table_schema);
 
-        // WHEN: A complete update row contains a null array.
+        // WHEN: A complete update row containing a null array is encoded.
         let row = clickhouse_full_update_row(
             &schema,
             UpdatedTableRow::Full(TableRow::new(vec![Cell::Null])),
         )
         .unwrap();
-
-        // THEN: The null array is accepted for later encoding.
         let values = row
             .into_values()
             .into_iter()
             .map(cell_to_clickhouse_value)
             .collect::<EtlResult<Vec<_>>>()
             .unwrap();
+        let mut buf = Vec::new();
+        encode_to_row_binary(values, &[ColumnEncoding::Array], &mut buf).unwrap();
 
-        // WHEN: RowBinary encodes the array as non-nullable.
-        let error = encode_to_row_binary(values, &[false], &mut Vec::new()).unwrap_err();
-
-        // THEN: RowBinary encoding reports the conversion error.
-        assert_eq!(error.kind(), ErrorKind::ConversionError);
+        // THEN: RowBinary carries a zero-length array.
+        assert_eq!(buf, [0x00]);
     }
 
     #[test]
@@ -3950,7 +3927,15 @@ mod tests {
         .unwrap();
 
         // THEN: Only the Nullable wrapper adds a null marker.
-        assert_eq!(layout.nullable_flags(), [false, true, false, false]);
+        assert_eq!(
+            layout.column_encodings(),
+            [
+                ColumnEncoding::Required,
+                ColumnEncoding::Nullable,
+                ColumnEncoding::Array,
+                ColumnEncoding::Required,
+            ]
+        );
     }
 
     /// Any column drift other than an outer `Nullable(...)` rejects the table.

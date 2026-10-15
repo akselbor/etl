@@ -7,7 +7,8 @@
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use etl_config::shared::{
-    validate_copy_concurrency, validate_source_tls_config, validate_table_error_retry_delay_ms,
+    Validate, validate_copy_concurrency, validate_source_tls_config,
+    validate_table_error_retry_delay_ms,
 };
 use etl_postgres::slots::EtlReplicationSlot;
 use tokio::sync::{Mutex, Semaphore};
@@ -132,9 +133,9 @@ where
     /// store cache, creates the table synchronization worker pool, and starts
     /// the apply worker for processing replication stream events.
     ///
-    /// Invalid copy concurrency, an unsupported retry delay, or a blank trust
-    /// bundle with source TLS enabled returns [`ErrorKind::ConfigError`] before
-    /// any startup work.
+    /// Invalid copy concurrency, an unsupported retry delay, invalid slot
+    /// options, or a blank trust bundle with source TLS enabled returns
+    /// [`ErrorKind::ConfigError`] before any startup work.
     /// After this method succeeds, subsequent calls return
     /// [`ErrorKind::InvalidState`] without performing any startup work.
     pub async fn start(&mut self) -> EtlResult<()> {
@@ -155,6 +156,9 @@ where
         validate_table_error_retry_delay_ms(self.config.table_error_retry_delay_ms).map_err(
             |err| etl_error!(ErrorKind::ConfigError, "Invalid table error retry delay", source: err),
         )?;
+        self.config.replication_slot.validate().map_err(|err| {
+            etl_error!(ErrorKind::ConfigError, "Invalid replication slot configuration", source: err)
+        })?;
 
         info!(
             publication_name = %self.config.publication_name,
@@ -252,28 +256,34 @@ where
             warn!("pipeline was not started, skipping wait");
             return Ok(());
         };
+
         let Some(PipelineTasks { apply_worker, pool, memory_monitor_task }) =
             tasks.lock().await.take()
         else {
             bail!(ErrorKind::InvalidState, "Pipeline wait has already been called");
         };
+
         // Cancellation must reach workers even when an error or a dropped
         // waiter skips the successful teardown sequence.
         let _shutdown_guard = self.shutdown_token.clone().drop_guard();
 
-        // The apply worker may spawn table sync workers until it exits.
         debug!("waiting for apply worker to complete");
+
+        // The apply worker may spawn table sync workers until it exits.
         apply_worker.wait().await?;
         self.shutdown();
 
         debug!("waiting for table sync workers to complete");
+
         pool.wait_all().await?;
 
         debug!("waiting for destination shutdown to complete");
+
         self.destination.shutdown().await?;
 
-        // Consumers need fresh readings until workers and destination drain.
         debug!("waiting for memory monitor to complete");
+
+        // Consumers need fresh readings until workers and destination drain.
         abort_and_join(memory_monitor_task).await?;
 
         Ok(())
@@ -307,9 +317,13 @@ where
     /// workers were spawned, still shuts down the constructed destination.
     pub async fn shutdown_and_wait(self) -> EtlResult<()> {
         self.shutdown();
+
+        // If the pipeline was not started, we invoke the destination shutdown
+        // directly here, otherwise it's done inside the `wait` method.
         if matches!(self.state, PipelineState::NotStarted) {
             return self.destination.shutdown().await;
         }
+
         self.wait().await
     }
 
