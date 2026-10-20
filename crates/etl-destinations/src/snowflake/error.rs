@@ -1,6 +1,33 @@
-use etl::error::{ErrorKind, EtlError};
+use etl::{
+    error::{ErrorKind, EtlError, Retryability},
+    schema::TableId,
+};
 use reqwest::StatusCode;
 use serde::Deserialize;
+
+use crate::{
+    retry::{ClassifiedError, classified_error},
+    snowflake::encoding::CdcOperation,
+};
+
+/// Name and serialized length of the largest column in a rejected row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LargestColumn {
+    /// Destination column name.
+    pub name: String,
+    /// Serialized JSON length of the value, including string quotes.
+    pub serialized_bytes: usize,
+}
+
+/// Formats the largest-column clause of [`Error::RowTooLarge`].
+fn describe_largest_column(largest_column: &Option<LargestColumn>) -> String {
+    match largest_column {
+        Some(column) => {
+            format!(", largest column {} {} B", column.name, column.serialized_bytes)
+        }
+        None => String::new(),
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -25,6 +52,43 @@ pub enum Error {
     #[error("Encoding error: {0}")]
     Encoding(String),
 
+    /// A PostgreSQL JSON array contains a SQL-null element with no faithful
+    /// representation in the Snowpipe JSON request.
+    #[error(
+        "SQL NULL at index {element_index} in JSON array column '{column_name}' cannot be encoded \
+         without becoming JSON null"
+    )]
+    NullJsonArrayElement {
+        /// Source column containing the array.
+        column_name: String,
+        /// Zero-based position of the first SQL-null element.
+        element_index: usize,
+    },
+
+    /// The source or physical table cannot satisfy the CDC layout requirements.
+    #[error("Snowflake CDC layout is unsupported: {0}")]
+    UnsupportedLayout(String),
+
+    /// The source identity cannot support the received partial update or
+    /// delete.
+    #[error("Snowflake source identity is unsupported: {0}")]
+    UnsupportedIdentity(String),
+
+    /// An existing managed view cannot represent the newly applied schema.
+    #[error(
+        "Snowflake companion view '{name}' is unavailable under '{pending}'; restore a supported \
+         primary-key identity and source column names, or deliberately remove both reserved views \
+         to continue with raw CDC only"
+    )]
+    CompanionViewUnsupported {
+        /// Public view that is no longer available.
+        name: String,
+        /// Reserved view retaining ownership and grants.
+        pending: String,
+        /// Query-generation requirement the new schema violates.
+        source: Box<Error>,
+    },
+
     #[error("Configuration error: {0}")]
     Config(String),
 
@@ -39,6 +103,31 @@ pub enum Error {
 
     #[error("schema '{schema}' not found in database '{database}'")]
     SchemaNotFound { database: String, schema: String },
+
+    /// A single row cannot be sent: its complete compressed frame exceeds the
+    /// Snowflake request limit at the configured compression level.
+    #[error(
+        "Row for table {table_id} ({operation}, {column_count} columns, {serialized_bytes} B \
+         serialized{}) compresses to at least {compressed_lower_bound} B, over the \
+         {request_limit} B Snowflake request limit",
+        describe_largest_column(largest_column)
+    )]
+    RowTooLarge {
+        /// Source table whose row was rejected.
+        table_id: TableId,
+        /// CDC operation the row carried.
+        operation: CdcOperation,
+        /// Number of destination columns in the row.
+        column_count: usize,
+        /// Exact NDJSON line length, including the newline.
+        serialized_bytes: usize,
+        /// Largest column by serialized length, when it could be measured.
+        largest_column: Option<LargestColumn>,
+        /// Output length at which compression was stopped.
+        compressed_lower_bound: usize,
+        /// Request limit the frame had to fit.
+        request_limit: usize,
+    },
 }
 
 /// Stable, low-cardinality classification for a failed Snowpipe append.
@@ -56,6 +145,8 @@ pub(super) enum AppendFailureType {
     Channel,
     /// Request or response encoding failed.
     Encoding,
+    /// A single row cannot fit the request limit.
+    RowTooLarge,
     /// Destination configuration is invalid or incomplete.
     Configuration,
 }
@@ -70,6 +161,7 @@ impl AppendFailureType {
             Self::SnowpipeApi => "snowpipe_api",
             Self::Channel => "channel",
             Self::Encoding => "encoding",
+            Self::RowTooLarge => "row_too_large",
             Self::Configuration => "configuration",
         }
     }
@@ -80,10 +172,15 @@ impl Error {
     pub(super) const fn append_failure_type(&self) -> AppendFailureType {
         match self {
             Self::HttpTransport(_) => AppendFailureType::Transport,
+            // A 401 or an expired-token status means Snowflake rejected the
+            // credentials the request carried.
+            Self::Auth(_)
+            | Self::HttpStatus { status: StatusCode::UNAUTHORIZED, .. }
+            | Self::Snowpipe(
+                SnowpipeError::AuthenticationExpired
+                | SnowpipeError::HttpStatus { status: StatusCode::UNAUTHORIZED },
+            ) => AppendFailureType::Authentication,
             Self::HttpStatus { .. } | Self::Sql { .. } => AppendFailureType::Provider,
-            Self::Auth(_) | Self::Snowpipe(SnowpipeError::AuthenticationExpired) => {
-                AppendFailureType::Authentication
-            }
             Self::Snowpipe(
                 SnowpipeError::StaleContinuation
                 | SnowpipeError::ChannelInvalidated
@@ -93,8 +190,12 @@ impl Error {
             | Self::Channel(_) => AppendFailureType::Channel,
             Self::Snowpipe(SnowpipeError::ApiStatus { .. }) => AppendFailureType::SnowpipeApi,
             Self::Snowpipe(SnowpipeError::HttpStatus { .. }) => AppendFailureType::Provider,
-            Self::Encoding(_) => AppendFailureType::Encoding,
-            Self::Config(_)
+            Self::Encoding(_) | Self::NullJsonArrayElement { .. } => AppendFailureType::Encoding,
+            Self::RowTooLarge { .. } => AppendFailureType::RowTooLarge,
+            Self::UnsupportedIdentity(_)
+            | Self::UnsupportedLayout(_)
+            | Self::CompanionViewUnsupported { .. }
+            | Self::Config(_)
             | Self::MissingTableColumn { .. }
             | Self::UnexpectedTableColumn { .. }
             | Self::DatabaseNotFound(_)
@@ -103,13 +204,82 @@ impl Error {
     }
 }
 
+/// Request timeouts, rate limits, and server errors may succeed when sent
+/// again.
+fn http_status_retryability(status: StatusCode) -> Retryability {
+    if status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+    {
+        Retryability::Retryable
+    } else {
+        Retryability::Permanent
+    }
+}
+
+/// Transport failures, retryable HTTP statuses, and retryable Snowpipe
+/// responses may succeed when sent again. Authentication, SQL, channel,
+/// encoding, configuration, and schema errors repeat until something changes.
+impl ClassifiedError for Error {
+    fn retryability(&self) -> Retryability {
+        match self {
+            Self::HttpTransport(_) => Retryability::Retryable,
+            Self::HttpStatus { status, .. } => http_status_retryability(*status),
+            Self::Snowpipe(error) => error.retryability(),
+            Self::Auth(_)
+            | Self::Sql { .. }
+            | Self::Channel(_)
+            | Self::Encoding(_)
+            | Self::NullJsonArrayElement { .. }
+            | Self::UnsupportedIdentity(_)
+            | Self::UnsupportedLayout(_)
+            | Self::CompanionViewUnsupported { .. }
+            | Self::Config(_)
+            | Self::MissingTableColumn { .. }
+            | Self::UnexpectedTableColumn { .. }
+            | Self::DatabaseNotFound(_)
+            | Self::SchemaNotFound { .. }
+            | Self::RowTooLarge { .. } => Retryability::Permanent,
+        }
+    }
+}
+
 impl From<Error> for EtlError {
     fn from(err: Error) -> Self {
         if matches!(&err, Error::MissingTableColumn { .. } | Error::UnexpectedTableColumn { .. }) {
-            return etl::etl_error!(
+            return classified_error(
                 ErrorKind::CorruptedTableSchema,
                 "Snowflake table schema is incompatible",
-                source: err
+                err,
+            );
+        }
+        if matches!(&err, Error::UnsupportedIdentity(_)) {
+            return classified_error(
+                ErrorKind::SourceReplicaIdentityError,
+                "Snowflake source identity is unsupported",
+                err,
+            );
+        }
+        if matches!(&err, Error::UnsupportedLayout(_)) {
+            return classified_error(
+                ErrorKind::DestinationLayoutUnsupported,
+                "Snowflake CDC layout is unsupported",
+                err,
+            );
+        }
+        if matches!(&err, Error::RowTooLarge { .. }) {
+            return classified_error(
+                ErrorKind::UnsupportedValueInDestination,
+                "Snowflake cannot accept a row of this size",
+                err,
+            );
+        }
+
+        if matches!(&err, Error::NullJsonArrayElement { .. }) {
+            return classified_error(
+                ErrorKind::NullValuesNotSupportedInArrayInDestination,
+                "Snowflake cannot preserve SQL NULL elements in JSON arrays",
+                err,
             );
         }
 
@@ -117,23 +287,40 @@ impl From<Error> for EtlError {
             Error::HttpTransport(_) => {
                 (ErrorKind::DestinationError, "Snowflake HTTP transport error")
             }
+            // A 401 or an expired-token status means Snowflake rejected the
+            // credentials the request carried.
+            Error::HttpStatus { status: StatusCode::UNAUTHORIZED, .. }
+            | Error::Snowpipe(
+                SnowpipeError::AuthenticationExpired
+                | SnowpipeError::HttpStatus { status: StatusCode::UNAUTHORIZED },
+            ) => (ErrorKind::DestinationAuthenticationError, "Snowflake rejected the credentials"),
             Error::HttpStatus { status, .. } if status.is_server_error() => {
                 (ErrorKind::DestinationError, "Snowflake server error")
             }
             Error::HttpStatus { .. } => (ErrorKind::DestinationError, "Snowflake HTTP error"),
-            Error::Auth(_) => (ErrorKind::DestinationError, "Snowflake authentication failed"),
+            Error::Auth(_) => {
+                (ErrorKind::DestinationAuthenticationError, "Snowflake authentication failed")
+            }
             Error::Sql { .. } => (ErrorKind::DestinationError, "Snowflake SQL execution failed"),
             Error::Snowpipe(_) => (ErrorKind::DestinationError, "Snowpipe streaming error"),
             Error::Channel(_) => (ErrorKind::DestinationError, "Snowflake channel error"),
             Error::Encoding(_) => (ErrorKind::InvalidData, "Snowflake encoding error"),
             Error::Config(_) => (ErrorKind::ConfigError, "Snowflake configuration error"),
-            Error::MissingTableColumn { .. } | Error::UnexpectedTableColumn { .. } => {
-                unreachable!("schema errors return above")
+            Error::CompanionViewUnsupported { .. } => {
+                (ErrorKind::ConfigError, "Snowflake companion view no longer supports the schema")
+            }
+            Error::MissingTableColumn { .. }
+            | Error::UnexpectedTableColumn { .. }
+            | Error::UnsupportedIdentity(_)
+            | Error::UnsupportedLayout(_)
+            | Error::RowTooLarge { .. }
+            | Error::NullJsonArrayElement { .. } => {
+                unreachable!("schema and unsupported value errors return above")
             }
             Error::DatabaseNotFound(_) => (ErrorKind::ConfigError, "Snowflake database not found"),
             Error::SchemaNotFound { .. } => (ErrorKind::ConfigError, "Snowflake schema not found"),
         };
-        etl::etl_error!(kind, description, err.to_string())
+        classified_error(kind, description, err)
     }
 }
 
@@ -217,6 +404,24 @@ impl SnowpipeError {
     }
 }
 
+/// Snowpipe API statuses other than 0, 2, and 4 may succeed when sent again.
+/// Channel errors need the channel reopened first, and an expired token stays
+/// expired after the client refreshes it and resends the request once.
+impl ClassifiedError for SnowpipeError {
+    fn retryability(&self) -> Retryability {
+        match self {
+            Self::StaleContinuation
+            | Self::ChannelInvalidated
+            | Self::ChannelHasUncommittedRows
+            | Self::ChannelNotFound
+            | Self::AuthenticationExpired
+            | Self::ApiStatus { status_code: 0 | 2 | 4, .. } => Retryability::Permanent,
+            Self::ApiStatus { .. } => Retryability::Retryable,
+            Self::HttpStatus { status } => http_status_retryability(*status),
+        }
+    }
+}
+
 /// Minimal Snowpipe error response envelope used for classification.
 #[derive(Deserialize)]
 struct SnowpipeErrorResponse {
@@ -234,6 +439,17 @@ mod tests {
 
     use super::*;
 
+    /// Unsupported array elements retain their typed cause and stable kind.
+    #[test]
+    fn json_array_null_error_is_preserved() {
+        let error =
+            Error::NullJsonArrayElement { column_name: "payload".to_owned(), element_index: 2 };
+        assert_eq!(error.append_failure_type(), AppendFailureType::Encoding);
+        let error = EtlError::from(error);
+        assert_eq!(error.kind(), ErrorKind::NullValuesNotSupportedInArrayInDestination);
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
     #[test]
     fn table_schema_error_is_preserved() {
         let error = Error::MissingTableColumn {
@@ -246,6 +462,34 @@ mod tests {
 
         assert_eq!(error.kind(), ErrorKind::CorruptedTableSchema);
         assert_eq!(source.to_string(), "Snowflake table 'events' is missing column 'id'");
+    }
+
+    #[test]
+    fn row_too_large_is_an_unsupported_value_with_structural_details() {
+        let error = Error::RowTooLarge {
+            table_id: etl::schema::TableId::new(42),
+            operation: crate::snowflake::CdcOperation::Update,
+            column_count: 3,
+            serialized_bytes: 13_613_900,
+            largest_column: Some(LargestColumn {
+                name: "payload".to_owned(),
+                serialized_bytes: 13_613_000,
+            }),
+            compressed_lower_bound: 5_452_596,
+            request_limit: 4_194_304,
+        };
+        assert_eq!(error.append_failure_type(), AppendFailureType::RowTooLarge);
+        assert_eq!(
+            error.to_string(),
+            "Row for table 42 (update, 3 columns, 13613900 B serialized, largest column payload \
+             13613000 B) compresses to at least 5452596 B, over the 4194304 B Snowflake request \
+             limit"
+        );
+
+        let error = EtlError::from(error);
+        assert_eq!(error.kind(), ErrorKind::UnsupportedValueInDestination);
+        let source = error.source().unwrap();
+        assert!(source.to_string().starts_with("Row for table 42"));
     }
 
     #[test]
@@ -336,5 +580,104 @@ mod tests {
 
             assert!(matches, "{case}: {error:?}");
         }
+    }
+
+    /// Transport failures, request timeouts, rate limits, server errors, and
+    /// transient Snowpipe statuses are retryable. A token that was already
+    /// refreshed once, a rejected request, and channel errors are not.
+    #[test]
+    fn errors_classify_retryability() {
+        let http = |status: StatusCode| Error::HttpStatus { status, body: String::new() };
+        let api_status = |status_code| {
+            Error::Snowpipe(SnowpipeError::ApiStatus { status_code, message: String::new() })
+        };
+
+        for error in [
+            http(StatusCode::REQUEST_TIMEOUT),
+            http(StatusCode::TOO_MANY_REQUESTS),
+            http(StatusCode::SERVICE_UNAVAILABLE),
+            api_status(1),
+            api_status(99),
+            Error::Snowpipe(SnowpipeError::HttpStatus { status: StatusCode::BAD_GATEWAY }),
+        ] {
+            assert_eq!(error.retryability(), Retryability::Retryable, "{error:?}");
+        }
+        for error in [
+            http(StatusCode::UNAUTHORIZED),
+            http(StatusCode::BAD_REQUEST),
+            api_status(0),
+            api_status(2),
+            Error::Snowpipe(SnowpipeError::AuthenticationExpired),
+            Error::Snowpipe(SnowpipeError::StaleContinuation),
+            Error::Auth("expired".to_owned()),
+            Error::Sql { statement_handle: None, message: String::new() },
+        ] {
+            assert_eq!(error.retryability(), Retryability::Permanent, "{error:?}");
+        }
+    }
+
+    /// The converted ETL error keeps the Snowflake error as its source and
+    /// carries its retryability.
+    #[test]
+    fn conversion_records_retryability_and_source() {
+        let unavailable = EtlError::from(Error::HttpStatus {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: String::new(),
+        });
+        let unauthorized = EtlError::from(Error::HttpStatus {
+            status: StatusCode::UNAUTHORIZED,
+            body: String::new(),
+        });
+
+        assert_eq!(unavailable.kind(), ErrorKind::DestinationError);
+        assert_eq!(unavailable.retryability(), Retryability::Retryable);
+        assert!(unavailable.source().is_some());
+        assert_eq!(unauthorized.retryability(), Retryability::Permanent);
+        for (source, kind) in [
+            (
+                Error::UnsupportedIdentity("invalid key".into()),
+                ErrorKind::SourceReplicaIdentityError,
+            ),
+            (
+                Error::UnsupportedLayout("invalid layout".into()),
+                ErrorKind::DestinationLayoutUnsupported,
+            ),
+        ] {
+            assert_eq!(source.retryability(), Retryability::Permanent);
+            let error = EtlError::from(source);
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.retryability(), Retryability::Permanent);
+            assert!(error.source().is_some());
+        }
+    }
+
+    /// Rejected credentials stop for an operator with the destination
+    /// credentials hint and count as authentication append failures, from
+    /// both the SQL API and Snowpipe Streaming.
+    #[test]
+    fn authentication_failures_convert_to_authentication_errors() {
+        for source in [
+            Error::Auth("token exchange rejected".to_owned()),
+            Error::HttpStatus { status: StatusCode::UNAUTHORIZED, body: String::new() },
+            Error::Snowpipe(SnowpipeError::AuthenticationExpired),
+            Error::Snowpipe(SnowpipeError::HttpStatus { status: StatusCode::UNAUTHORIZED }),
+        ] {
+            let description = format!("{source:?}");
+            assert_eq!(
+                source.append_failure_type(),
+                AppendFailureType::Authentication,
+                "{description}"
+            );
+            let error = EtlError::from(source);
+
+            assert_eq!(error.kind(), ErrorKind::DestinationAuthenticationError, "{description}");
+            assert_eq!(error.retryability(), Retryability::Permanent, "{description}");
+        }
+
+        // Other client errors keep the generic kind and provider label.
+        let forbidden = Error::HttpStatus { status: StatusCode::FORBIDDEN, body: String::new() };
+        assert_eq!(forbidden.append_failure_type(), AppendFailureType::Provider);
+        let forbidden = EtlError::from(forbidden);
+        assert_eq!(forbidden.kind(), ErrorKind::DestinationError);
     }
 }

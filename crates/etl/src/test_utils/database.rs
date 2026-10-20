@@ -23,12 +23,21 @@
 use std::time::Duration;
 
 use etl_config::shared::{PgConnectionConfig, TcpKeepaliveConfig};
-use etl_postgres::{test_utils::local_tls_config_from_env, tokio::test_utils::PgDatabase};
+use etl_postgres::{
+    test_utils::{
+        local_tls_config_from_env, test_database_port_from_env, test_database_replica_port_from_env,
+    },
+    tokio::test_utils::PgDatabase,
+};
 use pg_escape::quote_identifier;
 use tokio_postgres::{Client, types::PgLsn};
 use uuid::Uuid;
 
-use crate::{postgres::migrations, schema::TableName, test_utils::notify::DEFAULT_NOTIFY_TIMEOUT};
+use crate::{
+    postgres::migrations,
+    schema::{TableId, TableName},
+    test_utils::notify::DEFAULT_NOTIFY_TIMEOUT,
+};
 
 /// The schema name used for organizing test tables.
 ///
@@ -37,10 +46,10 @@ use crate::{postgres::migrations, schema::TableName, test_utils::notify::DEFAULT
 pub const TEST_DATABASE_SCHEMA: &str = "test";
 
 const DEFAULT_DATABASE_HOST: &str = "localhost";
-const DEFAULT_DATABASE_PORT: &str = "5430";
 const DEFAULT_DATABASE_USERNAME: &str = "postgres";
 const DEFAULT_DATABASE_PASSWORD: &str = "postgres";
 const READ_REPLICA_PORT_OFFSET: u16 = 1000;
+
 /// Creates a [`TableName`] in the test schema.
 ///
 /// This helper function constructs a [`TableName`] with the schema set to the
@@ -48,6 +57,52 @@ const READ_REPLICA_PORT_OFFSET: u16 = 1000;
 /// consistent table naming across test scenarios.
 pub fn test_table_name(name: &str) -> TableName {
     TableName { schema: TEST_DATABASE_SCHEMA.to_owned(), name: name.to_owned() }
+}
+
+/// Asserts that a table and its descendants have no conflicting relation locks.
+///
+/// Use an idle connection separate from the copy connections. PostgreSQL may
+/// still be processing disconnected copy sessions after local shutdown joins
+/// their tasks, so wait for lock release on the server. A lock timeout detects
+/// leaked locks; rollback releases the assertion's own locks.
+pub async fn assert_table_locks_released(client: &Client, table_name: &TableName) {
+    client
+        .batch_execute(&format!(
+            "begin; set local lock_timeout = '10s';
+             lock table {} in access exclusive mode; rollback",
+            table_name.as_quoted_identifier(),
+        ))
+        .await
+        .unwrap();
+}
+
+/// Waits until PostgreSQL reports the requested relation-lock state.
+///
+/// PostgreSQL provides no lock-state notification, so polling uses a short
+/// backoff to avoid busy-looping against the source. The deadline detects a
+/// missing synchronization point; elapsed time never releases the barrier.
+pub async fn wait_for_table_lock(client: &Client, table_id: TableId, mode: &str, granted: bool) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let row = client
+                .query_one(
+                    "select exists (select 1 from pg_locks
+                     where relation = $1 and mode = $2 and granted = $3
+                       and database = (select oid from pg_database
+                                       where datname = current_database()))",
+                    &[&table_id, &mode, &granted],
+                )
+                .await
+                .unwrap();
+            if row.get::<_, bool>(0) {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 /// Generates Postgres connection configuration for isolated test databases.
@@ -60,7 +115,8 @@ pub fn test_table_name(name: &str) -> TableName {
 /// Configuration is read from environment variables, falling back to defaults
 /// suitable for the local Docker Compose setup:
 /// - `TESTS_DATABASE_HOST`: Postgres server hostname (default: `localhost`)
-/// - `TESTS_DATABASE_PORT`: Postgres server port (default: `5430`)
+/// - `TESTS_DATABASE_PORT`: Postgres server port (default: `5430`); sharded
+///   runs offset it by the test's shard
 /// - `TESTS_DATABASE_USERNAME`: Database user (default: `postgres`)
 /// - `TESTS_DATABASE_PASSWORD`: Database password (default: `postgres`)
 /// - `TESTS_DATABASE_TLS_ENABLED`: Whether test clients use TLS (default:
@@ -70,10 +126,7 @@ fn local_pg_connection_config() -> PgConnectionConfig {
     PgConnectionConfig {
         host: std::env::var("TESTS_DATABASE_HOST").unwrap_or(DEFAULT_DATABASE_HOST.into()),
         hostaddr: None,
-        port: std::env::var("TESTS_DATABASE_PORT")
-            .unwrap_or(DEFAULT_DATABASE_PORT.into())
-            .parse()
-            .expect("TESTS_DATABASE_PORT must be a valid port number"),
+        port: test_database_port_from_env(),
         name: Uuid::new_v4().to_string(),
         username: std::env::var("TESTS_DATABASE_USERNAME")
             .unwrap_or(DEFAULT_DATABASE_USERNAME.into()),
@@ -91,7 +144,8 @@ fn local_pg_connection_config() -> PgConnectionConfig {
 /// The database name and credentials are inherited from `source_config`, while
 /// the host and port default to the local Docker Compose replica convention.
 /// Override them with `TESTS_DATABASE_REPLICA_HOST` and
-/// `TESTS_DATABASE_REPLICA_PORT` when running against a custom standby.
+/// `TESTS_DATABASE_REPLICA_PORT` when running against a custom standby;
+/// sharded runs offset the replica port like the source port.
 pub fn local_pg_read_replica_connection_config(
     source_config: &PgConnectionConfig,
 ) -> PgConnectionConfig {
@@ -104,10 +158,7 @@ pub fn local_pg_read_replica_connection_config(
     replica_config.host =
         std::env::var("TESTS_DATABASE_REPLICA_HOST").unwrap_or_else(|_| source_config.host.clone());
     replica_config.hostaddr = None;
-    replica_config.port = std::env::var("TESTS_DATABASE_REPLICA_PORT")
-        .unwrap_or_else(|_| default_replica_port.to_string())
-        .parse()
-        .expect("TESTS_DATABASE_REPLICA_PORT must be a valid port number");
+    replica_config.port = test_database_replica_port_from_env().unwrap_or(default_replica_port);
 
     replica_config
 }

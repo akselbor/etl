@@ -17,11 +17,11 @@ use tokio_postgres::{
 };
 use url::Url;
 
-use crate::ducklake::LAKE_CATALOG;
+use crate::{ducklake::LAKE_CATALOG, retry::classified_error};
 
 const DUCKDB_EXTENSION_ROOT_ENV_VAR: &str = "ETL_DUCKDB_EXTENSION_ROOT";
 const CONTAINER_DUCKDB_EXTENSION_ROOT: &str = "/app/duckdb_extensions";
-const DUCKDB_EXTENSION_VERSION: &str = "1.5.3";
+const DUCKDB_EXTENSION_VERSION: &str = "1.5.6";
 const DUCKLAKE_EXTENSION_FILE: &str = "ducklake.duckdb_extension";
 const HTTPFS_EXTENSION_FILE: &str = "httpfs.duckdb_extension";
 const POSTGRES_SCANNER_EXTENSION_FILE: &str = "postgres_scanner.duckdb_extension";
@@ -345,11 +345,7 @@ pub(super) fn catalog_conninfo_from_url(catalog_url: &Url) -> EtlResult<String> 
     }
 
     let config = PgConfig::from_str(catalog_url.as_str()).map_err(|e| {
-        etl_error!(
-            ErrorKind::ConfigError,
-            "Invalid DuckLake PostgreSQL catalog URL",
-            source: e
-        )
+        classified_error(ErrorKind::ConfigError, "Invalid DuckLake PostgreSQL catalog URL", e)
     })?;
     let explicit_query_options = explicit_query_options(catalog_url);
     reject_unsupported_query_options(&explicit_query_options)?;
@@ -389,10 +385,10 @@ pub(super) fn catalog_conninfo_from_url(catalog_url: &Url) -> EtlResult<String> 
     }
     if let Some(password) = config.get_password() {
         let password = std::str::from_utf8(password).map_err(|e| {
-            etl_error!(
+            classified_error(
                 ErrorKind::ConfigError,
                 "DuckLake PostgreSQL catalog URL contains non-utf8 password",
-                source: e
+                e,
             )
         })?;
         push_conninfo_pair(&mut parts, "password", password);
@@ -405,30 +401,30 @@ pub(super) fn catalog_conninfo_from_url(catalog_url: &Url) -> EtlResult<String> 
     }
     if let Some(ssl_cert) = config.get_ssl_cert() {
         let ssl_cert = std::str::from_utf8(ssl_cert).map_err(|e| {
-            etl_error!(
+            classified_error(
                 ErrorKind::ConfigError,
                 "DuckLake PostgreSQL catalog URL contains non-utf8 sslcert",
-                source: e
+                e,
             )
         })?;
         push_conninfo_pair(&mut parts, "sslcert", ssl_cert);
     }
     if let Some(ssl_key) = config.get_ssl_key() {
         let ssl_key = std::str::from_utf8(ssl_key).map_err(|e| {
-            etl_error!(
+            classified_error(
                 ErrorKind::ConfigError,
                 "DuckLake PostgreSQL catalog URL contains non-utf8 sslkey",
-                source: e
+                e,
             )
         })?;
         push_conninfo_pair(&mut parts, "sslkey", ssl_key);
     }
     if let Some(ssl_root_cert) = config.get_ssl_root_cert() {
         let ssl_root_cert = std::str::from_utf8(ssl_root_cert).map_err(|e| {
-            etl_error!(
+            classified_error(
                 ErrorKind::ConfigError,
                 "DuckLake PostgreSQL catalog URL contains non-utf8 sslrootcert",
-                source: e
+                e,
             )
         })?;
         push_conninfo_pair(&mut parts, "sslrootcert", ssl_root_cert);
@@ -743,14 +739,16 @@ fn build_setup_plan_with_strategy(
         .map(|schema| format!(", METADATA_SCHEMA {}", quote_literal(schema)))
         .unwrap_or_default();
 
+    // Name the metadata catalog so schema discovery can access it.
     steps.push(DuckLakeSetupStep {
         label: "attach_catalog",
         sql: format!(
             "ATTACH {} AS {lake_catalog} (DATA_PATH {}, DATA_INLINING_ROW_LIMIT {}, \
-             AUTOMATIC_MIGRATION true{metadata_schema_clause});",
+             AUTOMATIC_MIGRATION true, metadata_catalog {}{metadata_schema_clause});",
             quote_literal(&format!("ducklake:{catalog_target}")),
             quote_literal(data_path),
-            data_inlining_row_limit
+            data_inlining_row_limit,
+            quote_literal(&format!("__ducklake_metadata_{LAKE_CATALOG}")),
         ),
     });
     steps.push(DuckLakeSetupStep {
@@ -765,6 +763,7 @@ fn build_setup_plan_with_strategy(
 mod tests {
     use std::fs;
 
+    use duckdb::Connection;
     use tempfile::TempDir;
 
     use super::*;
@@ -780,6 +779,13 @@ mod tests {
         }
 
         tempdir
+    }
+
+    /// Keeps the bundled engine compatible with the pinned extension downloads.
+    #[test]
+    fn bundled_duckdb_matches_extension_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(conn.version().unwrap(), format!("v{DUCKDB_EXTENSION_VERSION}"));
     }
 
     #[test]
@@ -1294,6 +1300,7 @@ mod tests {
         assert!(plan.steps()[2].sql.contains("URL_COMPATIBILITY_MODE true"));
         assert!(plan.steps()[3].sql.contains("ATTACH"));
         assert!(plan.steps()[3].sql.contains("METADATA_SCHEMA 'ducklake'"));
+        assert!(plan.steps()[3].sql.contains("metadata_catalog '__ducklake_metadata_lake'"));
         assert_eq!(
             plan.steps()[4].sql,
             configure_parquet_settings_sql(&DuckLakeWriterConfig::default())

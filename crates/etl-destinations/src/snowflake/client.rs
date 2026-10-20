@@ -1,10 +1,13 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use etl::{
     pipeline::PipelineId,
     schema::{
-        ColumnAlterationKind, ColumnPresenceChangeReason, ColumnSchema, SchemaOperation,
-        SchemaPlan, TableId,
+        ColumnAlterationKind, ColumnPresenceChangeReason, ColumnSchema, ReplicatedTableSchema,
+        SchemaOperation, SchemaPlan, TableId,
     },
 };
 use metrics::{counter, gauge, histogram};
@@ -34,6 +37,7 @@ use crate::{
             DEFAULT_COMMIT_WAIT_TIMEOUT, OffsetToken, PendingDurabilityTarget, RestStreamClient,
             RowBatch, StreamClient,
         },
+        view::CompanionView,
     },
 };
 
@@ -74,6 +78,10 @@ pub(super) struct DetachedTableForCopy<C> {
     channel: Option<Arc<Mutex<ChannelHandle<C>>>>,
     /// Snowflake table name to drop after retiring local state.
     table_name: String,
+    /// Whether durable destination metadata establishes ownership.
+    owned: bool,
+    /// Preserve grants only when the fresh copy will reuse the same raw name.
+    preserve_view: bool,
 }
 
 /// Maximum accepted Snowflake row batches before forcing a durability wait.
@@ -260,6 +268,8 @@ pub struct Client<T, C = RestStreamClient<T>> {
     schema: String,
     pipeline_id: PipelineId,
     channels: ChannelMap<C>,
+    /// Tables whose companion view has been reconciled in this process.
+    prepared_views: Arc<RwLock<HashSet<TableId>>>,
     /// Stable lifecycle gates retained across channel removal and recreation.
     table_gates: Arc<Mutex<HashMap<TableId, Arc<Mutex<()>>>>>,
     pending_durability: Arc<Mutex<PendingDurabilityState>>,
@@ -274,6 +284,7 @@ impl<T: TokenProvider, C: StreamClient> Clone for Client<T, C> {
             schema: self.schema.clone(),
             pipeline_id: self.pipeline_id,
             channels: Arc::clone(&self.channels),
+            prepared_views: Arc::clone(&self.prepared_views),
             table_gates: Arc::clone(&self.table_gates),
             pending_durability: Arc::clone(&self.pending_durability),
         }
@@ -391,6 +402,7 @@ impl<T: TokenProvider, C: StreamClient> Client<T, C> {
             schema,
             pipeline_id,
             channels: Arc::new(RwLock::new(HashMap::new())),
+            prepared_views: Arc::new(RwLock::new(HashSet::new())),
             table_gates: Arc::new(Mutex::new(HashMap::new())),
             pending_durability: Arc::new(Mutex::new(PendingDurabilityState::default())),
         }
@@ -399,6 +411,40 @@ impl<T: TokenProvider, C: StreamClient> Client<T, C> {
     /// Returns whether this process already has an open channel for `table_id`.
     pub(super) async fn has_channel(&self, table_id: TableId) -> bool {
         self.channels.read().await.contains_key(&table_id)
+    }
+
+    /// Returns whether channel and view setup both completed in this process.
+    pub(super) async fn is_table_ready(&self, table_id: TableId) -> bool {
+        self.has_channel(table_id).await && self.prepared_views.read().await.contains(&table_id)
+    }
+
+    /// Reconciles the companion view while the caller owns the table lifecycle.
+    pub(super) async fn prepare_view(
+        &self,
+        table: &TableLifecycleGuard,
+        name: &str,
+        schema: &ReplicatedTableSchema,
+    ) -> Result<()> {
+        if self.prepared_views.read().await.contains(&table.table_id) {
+            return Ok(());
+        }
+        CompanionView::new(self.pipeline_id, table.table_id, name)
+            .prepare(&self.sql_client, name, schema)
+            .await?;
+        self.prepared_views.write().await.insert(table.table_id);
+        Ok(())
+    }
+
+    /// Forces reconciliation after an applied schema change without hiding a
+    /// compatible view.
+    pub(super) async fn invalidate_view(&self, table: &TableLifecycleGuard) {
+        self.prepared_views.write().await.remove(&table.table_id);
+    }
+
+    /// Invalidates cached readiness before making the public view unavailable.
+    pub(super) async fn park_view(&self, table: &TableLifecycleGuard, name: &str) -> Result<()> {
+        self.prepared_views.write().await.remove(&table.table_id);
+        CompanionView::new(self.pipeline_id, table.table_id, name).park(&self.sql_client).await
     }
 
     /// Checks whether a table exists in the configured Snowflake namespace.
@@ -450,7 +496,7 @@ impl<T: TokenProvider, C: StreamClient> Client<T, C> {
             let column_defs = schema::build_column_defs(columns);
             self.sql_client.create_table_if_not_exists(table_name, &column_defs).await?;
         }
-        self.validate_table(table_name, columns).await?;
+        self.prepare_existing_schema(table_name, columns).await?;
 
         // Obtain table channel.
         let mut handle = ChannelHandle::new(
@@ -467,17 +513,55 @@ impl<T: TokenProvider, C: StreamClient> Client<T, C> {
         Ok(())
     }
 
-    /// Validates a table before opening or reopening its streaming channel.
+    /// Validates or upgrades an owned raw table without opening a streaming
+    /// channel, including during idle-table view recovery.
+    pub(super) async fn prepare_existing_schema(
+        &self,
+        table_name: &str,
+        columns: &[ColumnSchema],
+    ) -> Result<()> {
+        schema::validate_no_cdc_collisions(columns)?;
+        // TODO: Remove this fallback and SqlClient::upgrade_legacy_table
+        // once all legacy destination tables (including inactive pipelines) are
+        // migrated and supported self-hosted upgrades no longer need it. New
+        // tables already include the mask; retain strict validation after
+        // removal.
+        match self.validate_table(table_name, columns).await {
+            Err(Error::MissingTableColumn { column_name, .. })
+                if column_name == schema::CDC_MISSING_COLUMNS_COLUMN =>
+            {
+                self.sql_client.upgrade_legacy_table(table_name, columns).await?;
+                self.validate_table(table_name, columns).await?;
+            }
+            result => result?,
+        }
+
+        Ok(())
+    }
+
+    /// Validates a table and removes conflicting JSON defaults before opening
+    /// or reopening its streaming channel.
     ///
-    /// Physical validation intentionally runs only at channel lifecycle
-    /// boundaries, not during ordinary writes.
+    /// Physical validation runs during setup and recovery, not during ordinary
+    /// writes.
     async fn validate_table(&self, table_name: &str, columns: &[ColumnSchema]) -> Result<()> {
         let expected_column_names = columns
             .iter()
             .map(|column| column.name.as_str())
-            .chain([schema::CDC_OPERATION_COLUMN, schema::CDC_SEQUENCE_COLUMN])
+            .chain([
+                schema::CDC_OPERATION_COLUMN,
+                schema::CDC_SEQUENCE_COLUMN,
+                schema::CDC_MISSING_COLUMNS_COLUMN,
+            ])
             .collect::<Vec<_>>();
-        self.sql_client.validate_table_schema(table_name, &expected_column_names).await
+        let json_column_names = columns
+            .iter()
+            .filter(|column| schema::is_json_type(&column.typ))
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        self.sql_client
+            .prepare_table_schema(table_name, &expected_column_names, &json_column_names)
+            .await
     }
 
     /// Translates a validated schema plan into Snowflake DDL in the supplied
@@ -666,6 +750,8 @@ impl<T: TokenProvider, C: StreamClient> Client<T, C> {
         &self,
         table_id: TableId,
         table_name: &str,
+        owned: bool,
+        preserve_view: bool,
     ) -> Result<DetachedTableForCopy<C>> {
         // Event tasks must be drained before taking this gate, since they may
         // need it to finish opening a channel. Never wait on it under a
@@ -675,9 +761,16 @@ impl<T: TokenProvider, C: StreamClient> Client<T, C> {
         pending.discard(table_id)?;
 
         let channel = self.channels.write().await.remove(&table_id);
+        self.invalidate_view(&table).await;
         pending.observe_metrics();
 
-        Ok(DetachedTableForCopy { table, channel, table_name: table_name.to_owned() })
+        Ok(DetachedTableForCopy {
+            table,
+            channel,
+            table_name: table_name.to_owned(),
+            owned,
+            preserve_view,
+        })
     }
 
     /// Drops the remote channel and table for previously detached local state.
@@ -685,7 +778,18 @@ impl<T: TokenProvider, C: StreamClient> Client<T, C> {
         &self,
         detached: DetachedTableForCopy<C>,
     ) -> Result<()> {
-        let DetachedTableForCopy { table, channel, table_name } = detached;
+        let DetachedTableForCopy { table, channel, table_name, owned, preserve_view } = detached;
+
+        if owned {
+            if preserve_view {
+                self.park_view(&table, &table_name).await?;
+            } else {
+                self.invalidate_view(&table).await;
+                CompanionView::new(self.pipeline_id, table.table_id, &table_name)
+                    .remove(&self.sql_client)
+                    .await?;
+            }
+        }
 
         let drop_channel_result = if let Some(channel) = channel {
             let mut guard = channel.lock().await;
@@ -727,13 +831,9 @@ impl<T: TokenProvider, C: StreamClient> Client<T, C> {
         channel.open().await.map(|_| ())
     }
 
-    /// Send table-copy row batches and retain their pending durability target.
-    pub async fn send_table_copy_batches(
-        &self,
-        table_id: TableId,
-        batches: Vec<RowBatch>,
-    ) -> Result<()> {
-        self.get_channel(table_id).await?.lock().await.accept_table_copy_batches(batches).await
+    /// Sends one table-copy request and retains its pending durability target.
+    pub async fn send_table_copy_batch(&self, table_id: TableId, batch: RowBatch) -> Result<()> {
+        self.get_channel(table_id).await?.lock().await.accept_table_copy_batch(batch).await
     }
 
     /// Wait until all accepted table-copy rows for one table are durable.
@@ -741,25 +841,19 @@ impl<T: TokenProvider, C: StreamClient> Client<T, C> {
         self.get_channel(table_id).await?.lock().await.wait_for_table_copy_durability().await
     }
 
-    /// Send streaming row batches and record accepted-but-not-durable targets.
-    pub async fn send_streaming_batches(
-        &self,
-        table_id: TableId,
-        batches: Vec<RowBatch>,
-    ) -> Result<()> {
+    /// Sends one streaming request and records its accepted-but-not-durable
+    /// target.
+    pub async fn send_streaming_batch(&self, table_id: TableId, batch: RowBatch) -> Result<()> {
         let channel = self.get_channel(table_id).await?;
-        for batch in batches {
-            if self.pending_durability.lock().await.would_exceed_limits(batch.size()) {
-                self.wait_for_pending_durability().await?;
-            }
+        if self.pending_durability.lock().await.would_exceed_limits(batch.size()) {
+            self.wait_for_pending_durability().await?;
+        }
 
-            let mut channel = channel.lock().await;
-            let accepted = channel.accept_streaming_batches(vec![batch]).await?;
-            for accepted_batch in accepted {
-                let mut pending = self.pending_durability.lock().await;
-                pending.record(table_id, accepted_batch)?;
-                pending.observe_metrics();
-            }
+        let mut channel = channel.lock().await;
+        if let Some(accepted) = channel.accept_streaming_batch(&batch).await? {
+            let mut pending = self.pending_durability.lock().await;
+            pending.record(table_id, accepted)?;
+            pending.observe_metrics();
         }
 
         Ok(())
@@ -865,7 +959,26 @@ mod tests {
         task::{Context, Poll, Waker},
     };
 
+    use etl::{
+        data::{Cell, OldTableRow, TableRow, UpdatedTableRow},
+        destination::{
+            Destination as _, DestinationTableMetadata, DestinationWriteStatus,
+            WriteEventsDurability,
+        },
+        error::ErrorKind,
+        event::{DeleteEvent, Event, InsertEvent, RelationEvent, TruncateEvent, UpdateEvent},
+        schema::{
+            IdentityMask, ReplicatedTableSchema, ReplicationMask, TableName, TableSchema, Type,
+        },
+        store::StateStore,
+        test_utils::{destination::write_events, notifying_store::NotifyingStore},
+    };
+    use serde_json::{Value, json};
+
     use super::*;
+    use crate::snowflake::{
+        ChannelStatusResponse, Destination, InsertRowsResponse, OpenChannelResponse,
+    };
 
     /// Polls a future once to check a deliberately blocked operation.
     fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
@@ -922,6 +1035,343 @@ mod tests {
             config.schema().to_owned(),
             PipelineId::from(1_u64),
         )
+    }
+
+    /// One complete request observed at the transport boundary.
+    struct RecordedRequest {
+        /// Destination table receiving the request.
+        table: String,
+        /// First encoded source offset.
+        start: OffsetToken,
+        /// Last encoded source offset.
+        end: OffsetToken,
+        /// Decoded rows in wire order.
+        rows: Vec<Value>,
+    }
+
+    /// In-memory Snowpipe transport that commits accepted requests immediately.
+    #[derive(Default)]
+    struct RecordingStreamClient {
+        /// Accepted requests in transport order.
+        requests: std::sync::Mutex<Vec<RecordedRequest>>,
+        /// Committed progress for each destination table.
+        statuses: std::sync::Mutex<HashMap<String, ChannelStatusResponse>>,
+        /// Rejects every append before recording any accepted rows.
+        fail_append: bool,
+        /// Counts attempted appends, including failures.
+        append_attempts: AtomicUsize,
+    }
+
+    impl StreamClient for RecordingStreamClient {
+        async fn discover_ingest_host(&self) -> Result<String> {
+            unreachable!("destination tests use pre-opened channels")
+        }
+
+        async fn open_channel(
+            &self,
+            _database: &str,
+            _schema: &str,
+            table: &str,
+            channel: &str,
+            offset_token: Option<&OffsetToken>,
+        ) -> Result<OpenChannelResponse> {
+            let mut statuses = self.statuses.lock().unwrap();
+            let status =
+                statuses.entry(table.to_owned()).or_insert_with(|| ChannelStatusResponse {
+                    channel: channel.to_owned(),
+                    status_code: "SUCCESS".to_owned(),
+                    offset_token: None,
+                    created_on_ms: Some(1),
+                    rows_inserted: 0,
+                    rows_parsed: 0,
+                    rows_error_count: 0,
+                    last_error_offset_upper_bound: None,
+                    last_error_message: None,
+                });
+            if let Some(offset) = offset_token {
+                status.offset_token = Some(offset.clone());
+            }
+            Ok(OpenChannelResponse {
+                continuation_token: status.rows_inserted.to_string(),
+                offset_token: status.offset_token.clone(),
+                status: status.clone(),
+            })
+        }
+
+        async fn drop_channel(
+            &self,
+            _database: &str,
+            _schema: &str,
+            _table: &str,
+            _channel: &str,
+        ) -> Result<()> {
+            unreachable!("destination tests do not drop channels")
+        }
+
+        async fn insert_rows(
+            &self,
+            _database: &str,
+            _schema: &str,
+            table: &str,
+            _channel: &str,
+            batch: &RowBatch,
+            continuation_token: &str,
+        ) -> Result<InsertRowsResponse> {
+            self.append_attempts.fetch_add(1, Ordering::SeqCst);
+            if self.fail_append {
+                return Err(Error::Channel("Synthetic append failure.".to_owned()));
+            }
+            let decoded = zstd::stream::decode_all(batch.bytes().as_ref()).unwrap();
+            let rows: Vec<Value> = serde_json::Deserializer::from_slice(&decoded)
+                .into_iter::<Value>()
+                .map(|row| row.unwrap())
+                .collect();
+            assert_eq!(rows.len(), batch.row_count());
+            self.requests.lock().unwrap().push(RecordedRequest {
+                table: table.to_owned(),
+                start: batch.start_offset().clone(),
+                end: batch.end_offset().clone(),
+                rows,
+            });
+            let mut statuses = self.statuses.lock().unwrap();
+            let status = statuses.get_mut(table).unwrap();
+            assert_eq!(continuation_token, status.rows_inserted.to_string());
+            status.rows_inserted += u64::try_from(batch.row_count()).unwrap();
+            status.rows_parsed = status.rows_inserted;
+            status.offset_token = Some(batch.end_offset().clone());
+            Ok(InsertRowsResponse { continuation_token: status.rows_inserted.to_string() })
+        }
+
+        async fn channel_status(
+            &self,
+            _database: &str,
+            _schema: &str,
+            table: &str,
+            _channel: &str,
+        ) -> Result<ChannelStatusResponse> {
+            Ok(self.statuses.lock().unwrap().get(table).unwrap().clone())
+        }
+    }
+
+    /// Builds applied table metadata and warmed channels without SQL or
+    /// credentials.
+    async fn recording_destination(
+        tables: u32,
+        fail_append: bool,
+    ) -> (
+        Destination<NotifyingStore, UnusedTokenProvider, RecordingStreamClient>,
+        Arc<RecordingStreamClient>,
+        Vec<ReplicatedTableSchema>,
+    ) {
+        let config = Config::new("example-account", "test-user", "test-db", "test-schema").unwrap();
+        let stream = Arc::new(RecordingStreamClient { fail_append, ..Default::default() });
+        let sql = SqlClient::new(config, Arc::new(UnusedTokenProvider), reqwest::Client::new());
+        let client = Client::with_clients(
+            sql,
+            Arc::clone(&stream),
+            "test-db".to_owned(),
+            "test-schema".to_owned(),
+            1_u64,
+        );
+        let store = NotifyingStore::new();
+        let mut schemas = Vec::new();
+        for id in 1..=tables {
+            let name = format!("table_{id}");
+            let table = Arc::new(TableSchema::new(
+                TableId::new(id),
+                TableName::new("public".to_owned(), name.clone()),
+                vec![
+                    ColumnSchema::new("id".to_owned(), Type::INT4, -1, 1, false)
+                        .with_primary_key(1),
+                    ColumnSchema::new("name".to_owned(), Type::TEXT, -1, 2, true),
+                ],
+            ));
+            let schema = ReplicatedTableSchema::from_masks(
+                Arc::clone(&table),
+                ReplicationMask::all(&table),
+                IdentityMask::from_bytes(vec![1, 0]),
+            );
+            let metadata = DestinationTableMetadata::new_applied(
+                name.clone(),
+                schema.inner().snapshot_id,
+                schema.replication_mask().clone(),
+            );
+            store.store_destination_table_metadata(schema.id(), metadata).await.unwrap();
+            let mut channel = ChannelHandle::new(
+                Arc::clone(&stream),
+                client.pipeline_id,
+                client.database.clone(),
+                client.schema.clone(),
+                name,
+            );
+            channel.open().await.unwrap();
+            client.channels.write().await.insert(schema.id(), Arc::new(Mutex::new(channel)));
+            // This transport-only fixture starts after remote setup completed.
+            client.prepared_views.write().await.insert(schema.id());
+            schemas.push(schema);
+        }
+        (Destination::new(client, store), stream, schemas)
+    }
+
+    /// Creates a small row that leaves its table's compressor open until
+    /// finished.
+    fn insert_event(schema: &ReplicatedTableSchema, ordinal: u64) -> Event {
+        Event::Insert(InsertEvent {
+            commit_lsn: 10.into(),
+            tx_ordinal: ordinal,
+            replicated_table_schema: schema.clone(),
+            table_row: TableRow::new(vec![Cell::I32(1), Cell::String("initial".to_owned())]),
+        })
+    }
+
+    #[tokio::test]
+    async fn cdc_many_interleaved_tables_preserve_packing_order_and_replay() {
+        let (destination, stream, schemas) = recording_destination(512, false).await;
+        let mut events = Vec::new();
+        for phase in 0..3 {
+            for (index, schema) in schemas.iter().enumerate() {
+                let ordinal = u64::try_from(phase * schemas.len() + index).unwrap();
+                events.push(match phase {
+                    0 => insert_event(schema, ordinal),
+                    1 => Event::Update(UpdateEvent {
+                        commit_lsn: 10.into(),
+                        tx_ordinal: ordinal,
+                        replicated_table_schema: schema.clone(),
+                        old_table_row: None,
+                        updated_table_row: UpdatedTableRow::Full(TableRow::new(vec![
+                            Cell::I32(1),
+                            Cell::String("updated".to_owned()),
+                        ])),
+                    }),
+                    _ => Event::Delete(DeleteEvent {
+                        commit_lsn: 10.into(),
+                        tx_ordinal: ordinal,
+                        replicated_table_schema: schema.clone(),
+                        old_table_row: Some(OldTableRow::Key(TableRow::new(vec![Cell::I32(1)]))),
+                    }),
+                });
+            }
+        }
+        let replay = events.clone();
+        let status = write_events(&destination, WriteEventsDurability::RequireDurable, events)
+            .await
+            .unwrap();
+        assert_eq!(status, DestinationWriteStatus::Durable);
+        let status = write_events(&destination, WriteEventsDurability::RequireDurable, replay)
+            .await
+            .unwrap();
+        assert_eq!(status, DestinationWriteStatus::Durable);
+        destination.shutdown().await.unwrap();
+
+        let mut requests = stream.requests.lock().unwrap();
+        requests.sort_by(|left, right| left.start.cmp(&right.start));
+        assert_eq!(requests.len(), schemas.len());
+        for (index, request) in requests.iter().enumerate() {
+            assert_eq!(request.table, format!("table_{}", index + 1));
+            assert_eq!(request.start, OffsetToken::new(10.into(), u64::try_from(index).unwrap()));
+            assert_eq!(
+                request.end,
+                OffsetToken::new(10.into(), u64::try_from(2 * schemas.len() + index).unwrap())
+            );
+            let expected: Vec<_> = ["insert", "update", "delete"]
+                .into_iter()
+                .enumerate()
+                .map(|(phase, operation)| {
+                    let ordinal = u64::try_from(phase * schemas.len() + index).unwrap();
+                    let mut row = json!({
+                        "id": 1, "_cdc_operation": operation,
+                        "_cdc_sequence_number": OffsetToken::new(10.into(), ordinal).to_string(),
+                        "_cdc_missing_columns": [],
+                    });
+                    if phase != 2 {
+                        row["name"] = json!(if phase == 0 { "initial" } else { "updated" });
+                    } else {
+                        row["name"] = json!(null);
+                        row["_cdc_missing_columns"] = json!([2]);
+                    }
+                    row
+                })
+                .collect();
+            assert_eq!(request.rows, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn cdc_finishes_first_table_before_encoding_later_tables() {
+        for fail_append in [false, true] {
+            let (destination, stream, schemas) = recording_destination(2, fail_append).await;
+            // The later table must not be encoded until the first request was
+            // sent.
+            let invalid_delete = Event::Delete(DeleteEvent {
+                commit_lsn: 10.into(),
+                tx_ordinal: 1,
+                replicated_table_schema: schemas[1].clone(),
+                old_table_row: None,
+            });
+            let error = write_events(
+                &destination,
+                WriteEventsDurability::RequireDurable,
+                vec![insert_event(&schemas[0], 0), invalid_delete],
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if fail_append {
+                    ErrorKind::DestinationError
+                } else {
+                    ErrorKind::SourceReplicaIdentityError
+                }
+            );
+            destination.shutdown().await.unwrap();
+            assert_eq!(stream.append_attempts.load(Ordering::SeqCst), 1);
+            assert_eq!(stream.requests.lock().unwrap().len(), usize::from(!fail_append));
+        }
+    }
+
+    #[tokio::test]
+    async fn cdc_relation_and_truncate_remain_write_barriers() {
+        for truncate in [false, true] {
+            let (destination, stream, schemas) = recording_destination(1, false).await;
+            let schema = &schemas[0];
+            let barrier = if truncate {
+                Event::Truncate(TruncateEvent {
+                    commit_lsn: 10.into(),
+                    tx_ordinal: 1,
+                    options: 0,
+                    truncated_tables: vec![schema.clone()],
+                })
+            } else {
+                Event::Relation(RelationEvent { replicated_table_schema: schema.clone() })
+            };
+            let result = write_events(
+                &destination,
+                WriteEventsDurability::MayDefer,
+                vec![insert_event(schema, 0), barrier, insert_event(schema, 2)],
+            )
+            .await;
+            if truncate {
+                // SQL deliberately fails; the post-truncate row must never be
+                // sent.
+                assert_eq!(result.unwrap_err().kind(), ErrorKind::DestinationAuthenticationError);
+            } else {
+                assert_eq!(result.unwrap(), DestinationWriteStatus::Accepted);
+                let status =
+                    write_events(&destination, WriteEventsDurability::RequireDurable, vec![])
+                        .await
+                        .unwrap();
+                assert_eq!(status, DestinationWriteStatus::Durable);
+            }
+            destination.shutdown().await.unwrap();
+            let requests = stream.requests.lock().unwrap();
+            assert_eq!(requests.len(), if truncate { 1 } else { 2 });
+            assert_eq!(requests[0].rows.len(), 1);
+            assert_eq!(requests[0].end, OffsetToken::new(10.into(), 0));
+            if !truncate {
+                assert_eq!(requests[1].rows.len(), 1);
+                assert_eq!(requests[1].start, OffsetToken::new(10.into(), 2));
+            }
+        }
     }
 
     #[test]
@@ -1149,7 +1599,7 @@ mod tests {
         let table_id = TableId::new(1);
         let mut setup = Box::pin(client.prepare_existing_table(table_id, "TABLE", &[]));
         assert!(poll_once(setup.as_mut()).is_pending());
-        let mut reset = Box::pin(client.detach_table_for_copy(table_id, "TABLE"));
+        let mut reset = Box::pin(client.detach_table_for_copy(table_id, "TABLE", false, false));
         assert!(poll_once(reset.as_mut()).is_pending());
 
         drop(setup);
@@ -1179,6 +1629,7 @@ mod tests {
             table_name.to_owned(),
         )));
         client.channels.write().await.insert(table_id, channel);
+        client.prepared_views.write().await.insert(table_id);
         client
             .pending_durability
             .lock()
@@ -1186,11 +1637,13 @@ mod tests {
             .record(table_id, accepted_batch(10, 1, 2, 20))
             .unwrap();
 
-        let detached = client.detach_table_for_copy(table_id, table_name).await.unwrap();
+        let detached =
+            client.detach_table_for_copy(table_id, table_name, false, false).await.unwrap();
 
         assert!(detached.channel.is_some());
         assert_eq!(detached.table_name, table_name);
         assert!(!client.channels.read().await.contains_key(&table_id));
+        assert!(!client.prepared_views.read().await.contains(&table_id));
         let pending = client.pending_durability.lock().await;
         assert!(pending.is_empty());
         assert_eq!(pending.row_batches, 0);

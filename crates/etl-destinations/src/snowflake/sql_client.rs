@@ -6,15 +6,16 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
-    retry::{RetryDecision, RetryPolicy, retry_with_backoff},
+    retry::{RetryPolicy, retry_with_backoff},
     snowflake::{
         Config, Error, Result,
-        auth::TokenProvider,
+        auth::{TokenProvider, send_with_token_refresh},
         sql::{quote_identifier, quote_string_literal},
     },
 };
 
-/// Retry policy for transient HTTP errors (408, 429, 5xx) during SQL API calls.
+/// Retry policy for retryable SQL API errors, such as transport failures and
+/// 408, 429, and 5xx statuses.
 const SQL_RETRY_POLICY: RetryPolicy = RetryPolicy {
     max_retries: 3,
     initial_delay: Duration::from_millis(500),
@@ -36,7 +37,8 @@ const USER_AGENT: &str = "supabase-etl/0.1.0";
 
 /// Executes DDL and metadata operations against Snowflake's SQL REST API.
 ///
-/// All DDL runs on Snowflake's Cloud Services layer (no warehouse required).
+/// Metadata-only DDL does not require a warehouse. Statements that query data,
+/// including `CREATE TABLE ... AS SELECT`, require an active warehouse.
 pub struct SqlClient<T> {
     config: Config,
     http: Client,
@@ -67,6 +69,20 @@ pub(crate) struct StatementResponse {
     result_set_meta_data: Option<ResultSetMetadata>,
 }
 
+#[cfg(test)]
+impl StatementResponse {
+    /// Returns column nullability for live query contract tests.
+    pub(crate) fn column_nullability(&self) -> Vec<(&str, Option<bool>)> {
+        self.result_set_meta_data
+            .as_ref()
+            .unwrap()
+            .row_type
+            .iter()
+            .map(|column| (column.name.as_str(), column.nullable))
+            .collect()
+    }
+}
+
 /// Column metadata returned with a Snowflake SQL result set.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,6 +100,10 @@ struct ResultSetMetadata {
 struct ResultColumnMetadata {
     /// Column name supplied by Snowflake.
     name: String,
+    /// Query result nullability, retained only for provider contract tests.
+    #[cfg(test)]
+    #[serde(default)]
+    nullable: Option<bool>,
 }
 
 impl<T: TokenProvider> SqlClient<T> {
@@ -91,7 +111,7 @@ impl<T: TokenProvider> SqlClient<T> {
         Self { config: config.without_credentials(), http, auth }
     }
 
-    /// Execute a DDL statement (runs on Cloud Services, no warehouse required).
+    /// Executes a DDL statement, discarding its result rows.
     ///
     /// Generates one request ID for this invocation so Snowflake can reconcile
     /// transport retries. A later invocation gets a new ID: recovery across
@@ -116,18 +136,83 @@ impl<T: TokenProvider> SqlClient<T> {
         self.execute_ddl(&sql).await
     }
 
-    /// Validates a table's write schema.
-    pub(crate) async fn validate_table_schema(
+    /// Validates the write schema and removes defaults from scalar JSON
+    /// columns.
+    ///
+    /// Omitted VARIANT fields encode SQL NULL. Legacy destination defaults
+    /// would replace that value, so they must be removed before channel open.
+    /// The migration is idempotent and leaves existing row values unchanged.
+    pub(crate) async fn prepare_table_schema(
         &self,
         table_name: &str,
         expected_column_names: &[&str],
+        json_column_names: &[&str],
     ) -> Result<()> {
         let fqn = self.fully_qualified_name(table_name);
-        let columns_response =
-            self.execute_statement(&format!("SHOW COLUMNS IN TABLE {fqn}")).await?;
-        let columns = parse_show_columns(&columns_response)?;
+        let show_columns = format!("show columns in table {fqn}");
+        let response = self.execute_statement(&show_columns).await?;
+        let columns = parse_show_columns(&response)?;
+        validate_column_names(table_name, expected_column_names, &columns)?;
+        validate_cdc_metadata(&response, &columns)?;
+        let defaults = json_columns_with_defaults(&response, json_column_names)?;
+        if defaults.is_empty() {
+            return Ok(());
+        }
 
-        validate_column_names(table_name, expected_column_names, &columns)
+        let clauses = defaults
+            .iter()
+            .map(|name| format!("column {} drop default", quote_identifier(name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.execute_ddl(&format!("alter table {fqn} alter {clauses}")).await?;
+
+        // Do not open the channel unless its omission contract is established.
+        // A failed migration can safely be retried on the next preparation.
+        let response = self.execute_statement(&show_columns).await?;
+        let columns = parse_show_columns(&response)?;
+        validate_column_names(table_name, expected_column_names, &columns)?;
+        validate_cdc_metadata(&response, &columns)?;
+        if !json_columns_with_defaults(&response, json_column_names)?.is_empty() {
+            return Err(Error::Config(format!(
+                "Snowflake table '{table_name}' still has defaults on JSON columns after migration"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Upgrades only the known legacy CDC format before opening a channel.
+    ///
+    /// Authoritative destination metadata must establish ownership first.
+    /// Repeating the additive DDL is safe after an unknown outcome. External
+    /// removal of previously written masks is unsupported and indistinguishable
+    /// from a legacy table without independent durable format evidence.
+    pub(super) async fn upgrade_legacy_table(
+        &self,
+        table_name: &str,
+        columns: &[etl::schema::ColumnSchema],
+    ) -> Result<()> {
+        use crate::snowflake::schema::{
+            CDC_MISSING_COLUMNS_COLUMN, CDC_OPERATION_COLUMN, CDC_SEQUENCE_COLUMN,
+        };
+
+        let fqn = self.fully_qualified_name(table_name);
+        let response = self.execute_statement(&format!("SHOW COLUMNS IN TABLE {fqn}")).await?;
+        let actual = parse_show_columns(&response)?;
+        let expected = columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .chain([CDC_OPERATION_COLUMN, CDC_SEQUENCE_COLUMN])
+            .collect::<Vec<_>>();
+        validate_column_names(table_name, &expected, &actual)?;
+        validate_cdc_metadata(&response, &actual)?;
+        // TODO: Remove after table migration coverage and the
+        // supported self-hosted upgrade path no longer require legacy
+        // format upgrades.
+        self.execute_ddl(&format!(
+            "ALTER TABLE {fqn} ADD COLUMN IF NOT EXISTS {} ARRAY",
+            quote_identifier(CDC_MISSING_COLUMNS_COLUMN),
+        ))
+        .await
     }
 
     /// Remove all rows from a table without dropping it.
@@ -156,6 +241,42 @@ impl<T: TokenProvider> SqlClient<T> {
         let resp = self.execute_statement(&sql).await?;
         let table_names = parse_show_table_names(&resp)?;
         Ok(table_names.contains(&table_name))
+    }
+
+    /// Lists exact object kinds and comments for companion-view ownership
+    /// checks.
+    pub(super) async fn objects_starting_with(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let response = self
+            .execute_statement(&format!(
+                "show objects in schema {}.{} starts with {}",
+                quote_identifier(&self.config.database),
+                quote_identifier(&self.config.schema),
+                quote_string_literal(prefix),
+            ))
+            .await?;
+        let names = parse_named_show_column(&response, "SHOW OBJECTS", "name")?;
+        let kinds = parse_named_show_column(&response, "SHOW OBJECTS", "kind")?;
+        let comments = parse_named_show_values(&response, "SHOW OBJECTS", "comment")?;
+        names
+            .into_iter()
+            .zip(kinds)
+            .zip(comments)
+            .map(|((name, kind), comment)| {
+                let comment = match comment {
+                    serde_json::Value::Null => "",
+                    serde_json::Value::String(value) => value,
+                    _ => {
+                        return Err(Error::Config(
+                            "Snowflake object comment is not a string".to_owned(),
+                        ));
+                    }
+                };
+                Ok((name.to_owned(), kind.to_owned(), comment.to_owned()))
+            })
+            .collect()
     }
 
     /// Add a nullable column to an existing table.
@@ -198,7 +319,7 @@ impl<T: TokenProvider> SqlClient<T> {
         self.execute_ddl(&format!("ALTER TABLE {fqn} RENAME COLUMN {old} TO {new}")).await
     }
 
-    fn fully_qualified_name(&self, name: &str) -> String {
+    pub(super) fn fully_qualified_name(&self, name: &str) -> String {
         format!(
             "{}.{}.{}",
             quote_identifier(&self.config.database),
@@ -213,7 +334,7 @@ impl<T: TokenProvider> SqlClient<T> {
     /// - HTTP 200: success, return parsed `StatementResponse`.
     /// - HTTP 202: async execution, poll until 200 or 422.
     /// - HTTP 422: SQL execution error, return `Error::Sql`.
-    /// - HTTP 401: invalidate cached token, retry once.
+    /// - HTTP 401: invalidate cached token, resend once.
     /// - HTTP 408/429/5xx: retriable via backoff.
     /// - Other 4xx: non-retriable `Error::HttpStatus`.
     pub(crate) async fn execute_statement(&self, sql: &str) -> Result<StatementResponse> {
@@ -236,6 +357,11 @@ impl<T: TokenProvider> SqlClient<T> {
         format!("{}/api/v2/statements?requestId={request_id}&retry=true", self.config.account_url())
     }
 
+    /// Build the status URL of an asynchronously executing statement.
+    fn statement_status_url(&self, statement_handle: &str) -> String {
+        format!("{}/api/v2/statements/{statement_handle}", self.config.account_url())
+    }
+
     /// Submit a SQL statement to a prebuilt URL and reuse it across retries.
     async fn execute_statement_at_url(&self, sql: &str, url: &str) -> Result<StatementResponse> {
         let body = StatementRequest {
@@ -247,7 +373,7 @@ impl<T: TokenProvider> SqlClient<T> {
 
         retry_with_backoff(
             SQL_RETRY_POLICY,
-            classify_for_retry,
+            |_| false,
             |d| d,
             |attempt| {
                 warn!(
@@ -266,80 +392,61 @@ impl<T: TokenProvider> SqlClient<T> {
 
     /// Submit a statement and interpret the HTTP response.
     ///
-    /// On a 401, invalidates the cached token and retries once.
+    /// On a 401, invalidates the cached token and resends once.
     async fn attempt_statement(
         &self,
         url: &str,
         body: &StatementRequest<'_>,
     ) -> Result<StatementResponse> {
-        let mut retried_auth = false;
+        let http_resp = send_with_token_refresh(self.auth.as_ref(), |token| {
+            self.http.post(url).bearer_auth(token).header("User-Agent", USER_AGENT).json(body)
+        })
+        .await?;
+        let status = http_resp.status();
 
-        loop {
-            let token = self.auth.get_token().await?;
-            let http_resp = self.send_post(url, &token, body).await?;
-            let status = http_resp.status();
+        match status {
+            StatusCode::OK => http_resp.json().await.map_err(Error::HttpTransport),
 
-            match status {
-                StatusCode::OK => return http_resp.json().await.map_err(Error::HttpTransport),
-
-                StatusCode::ACCEPTED => {
-                    let resp: StatementResponse =
-                        http_resp.json().await.map_err(Error::HttpTransport)?;
-                    return if let Some(ref handle) = resp.statement_handle {
-                        debug!(statement_handle = %handle, "statement executing asynchronously, polling");
-                        self.poll_until_complete(handle).await
-                    } else {
-                        Err(Error::Sql {
-                            statement_handle: None,
-                            message: "received 202 without a statement handle".into(),
-                        })
-                    };
+            StatusCode::ACCEPTED => {
+                let resp: StatementResponse =
+                    http_resp.json().await.map_err(Error::HttpTransport)?;
+                if let Some(handle) = &resp.statement_handle {
+                    debug!(statement_handle = %handle, "statement executing asynchronously, polling");
+                    self.poll_until_complete(&self.statement_status_url(handle), handle).await
+                } else {
+                    Err(Error::Sql {
+                        statement_handle: None,
+                        message: "received 202 without a statement handle".into(),
+                    })
                 }
+            }
 
-                StatusCode::UNPROCESSABLE_ENTITY => {
-                    let resp: StatementResponse =
-                        http_resp.json().await.map_err(Error::HttpTransport)?;
-                    return Err(Error::Sql {
-                        statement_handle: resp.statement_handle,
-                        message: resp.message.unwrap_or_default(),
-                    });
-                }
+            StatusCode::UNPROCESSABLE_ENTITY => {
+                let resp: StatementResponse =
+                    http_resp.json().await.map_err(Error::HttpTransport)?;
+                Err(Error::Sql {
+                    statement_handle: resp.statement_handle,
+                    message: resp.message.unwrap_or_default(),
+                })
+            }
 
-                StatusCode::UNAUTHORIZED if !retried_auth => {
-                    warn!("received 401 from sql rest api, invalidating cached token");
-                    self.auth.invalidate_token().await;
-                    retried_auth = true;
-                    continue;
-                }
-
-                _ => {
-                    let body_text = http_resp.text().await.unwrap_or_default();
-                    return Err(Error::HttpStatus { status, body: body_text });
-                }
+            _ => {
+                let body_text = http_resp.text().await.unwrap_or_default();
+                Err(Error::HttpStatus { status, body: body_text })
             }
         }
     }
 
-    async fn send_post(
+    /// Poll an async statement at `url` until Snowflake returns 200 (success)
+    /// or 422 (failure).
+    ///
+    /// Each poll refreshes a rejected token once, so a token that expires
+    /// during a long statement does not fail it.
+    async fn poll_until_complete(
         &self,
         url: &str,
-        token: &str,
-        body: &StatementRequest<'_>,
-    ) -> Result<reqwest::Response> {
-        self.http
-            .post(url)
-            .bearer_auth(token)
-            .header("User-Agent", USER_AGENT)
-            .json(body)
-            .send()
-            .await
-            .map_err(Error::HttpTransport)
-    }
-
-    /// Poll an async statement until Snowflake returns 200 (success) or 422
-    /// (failure).
-    async fn poll_until_complete(&self, statement_handle: &str) -> Result<StatementResponse> {
-        let url = format!("{}/api/v2/statements/{}", self.config.account_url(), statement_handle);
+        statement_handle: &str,
+    ) -> Result<StatementResponse> {
         let deadline = tokio::time::Instant::now() + POLL_TIMEOUT;
         let mut delay = POLL_INITIAL_DELAY;
 
@@ -357,15 +464,10 @@ impl<T: TokenProvider> SqlClient<T> {
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(POLL_MAX_DELAY);
 
-            let token = self.auth.get_token().await?;
-            let http_resp = self
-                .http
-                .get(&url)
-                .bearer_auth(&token)
-                .header("User-Agent", USER_AGENT)
-                .send()
-                .await
-                .map_err(Error::HttpTransport)?;
+            let http_resp = send_with_token_refresh(self.auth.as_ref(), |token| {
+                self.http.get(url).bearer_auth(token).header("User-Agent", USER_AGENT)
+            })
+            .await?;
 
             match http_resp.status() {
                 StatusCode::OK => return http_resp.json().await.map_err(Error::HttpTransport),
@@ -394,12 +496,12 @@ impl<T: TokenProvider> SqlClient<T> {
     }
 }
 
-/// Parse one named string column from a `SHOW` response.
-fn parse_named_show_column<'a>(
+/// Parse one named column from a complete `SHOW` response.
+fn parse_named_show_values<'a>(
     response: &'a StatementResponse,
     command: &str,
     result_column: &str,
-) -> Result<Vec<&'a str>> {
+) -> Result<Vec<&'a serde_json::Value>> {
     fn malformed_show_response(response: &StatementResponse, message: String) -> Error {
         Error::Sql { statement_handle: response.statement_handle.clone(), message }
     }
@@ -442,17 +544,84 @@ fn parse_named_show_column<'a>(
     let mut columns = Vec::with_capacity(rows.len());
 
     for (row_index, row) in rows.iter().enumerate() {
-        let value =
-            row.get(result_column_index).and_then(serde_json::Value::as_str).ok_or_else(|| {
-                malformed_show_response(
-                    response,
-                    format!("{command} row {row_index} has no string {result_column}"),
-                )
-            })?;
+        let value = row.get(result_column_index).ok_or_else(|| {
+            malformed_show_response(
+                response,
+                format!("{command} row {row_index} omitted {result_column}"),
+            )
+        })?;
         columns.push(value);
     }
 
     Ok(columns)
+}
+
+/// Parse one named string column from a complete `SHOW` response.
+fn parse_named_show_column<'a>(
+    response: &'a StatementResponse,
+    command: &str,
+    result_column: &str,
+) -> Result<Vec<&'a str>> {
+    parse_named_show_values(response, command, result_column)?
+        .into_iter()
+        .enumerate()
+        .map(|(row_index, value)| {
+            value.as_str().ok_or_else(|| Error::Sql {
+                statement_handle: response.statement_handle.clone(),
+                message: format!("{command} row {row_index} has no string {result_column}"),
+            })
+        })
+        .collect()
+}
+
+/// Finds defaults that would override SQL NULL in replicated JSON columns.
+///
+/// Check the physical type before changing defaults so an incompatible table
+/// is not silently adapted as if it had the expected JSON storage contract.
+fn json_columns_with_defaults<'a>(
+    response: &'a StatementResponse,
+    json_column_names: &[&str],
+) -> Result<Vec<&'a str>> {
+    if json_column_names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let names = parse_show_columns(response)?;
+    let types = parse_named_show_column(response, "SHOW COLUMNS", "data_type")?;
+    let defaults = parse_named_show_values(response, "SHOW COLUMNS", "default")?;
+    let mut conflicts = Vec::new();
+    for ((name, typ), default) in names.into_iter().zip(types).zip(defaults) {
+        if !json_column_names.contains(&name) {
+            continue;
+        }
+        let typ = serde_json::from_str::<serde_json::Value>(typ).ok();
+        let typ = typ
+            .as_ref()
+            .and_then(|typ| typ.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::Sql {
+                statement_handle: response.statement_handle.clone(),
+                message: format!("SHOW COLUMNS has invalid data_type metadata for column '{name}'"),
+            })?;
+        if typ != "VARIANT" {
+            return Err(Error::Config(format!(
+                "Snowflake JSON column '{name}' must have physical type VARIANT"
+            )));
+        }
+        match default {
+            serde_json::Value::Null => {}
+            serde_json::Value::String(expression) if expression.is_empty() => {}
+            serde_json::Value::String(_) => conflicts.push(name),
+            _ => {
+                return Err(Error::Sql {
+                    statement_handle: response.statement_handle.clone(),
+                    message: format!(
+                        "SHOW COLUMNS has invalid default metadata for column '{name}'"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(conflicts)
 }
 
 /// Parse exact column identifiers from `SHOW COLUMNS`.
@@ -463,6 +632,39 @@ fn parse_show_columns(response: &StatementResponse) -> Result<Vec<&str>> {
 /// Parse exact table identifiers from `SHOW TERSE TABLES`.
 fn parse_show_table_names(response: &StatementResponse) -> Result<Vec<&str>> {
     parse_named_show_column(response, "SHOW TERSE TABLES", "name")
+}
+
+/// Validates the CDC fields using the existing SHOW response.
+fn validate_cdc_metadata(response: &StatementResponse, names: &[&str]) -> Result<()> {
+    use crate::snowflake::schema::{
+        CDC_MISSING_COLUMNS_COLUMN, CDC_OPERATION_COLUMN, CDC_SEQUENCE_COLUMN,
+    };
+
+    let types = parse_named_show_column(response, "SHOW COLUMNS", "data_type")?;
+    let defaults = parse_named_show_values(response, "SHOW COLUMNS", "default")?;
+    // Names, types, and defaults come from the same SHOW rows in the same
+    // order.
+    for ((name, typ), default) in names.iter().zip(types).zip(defaults) {
+        let expected = match *name {
+            CDC_OPERATION_COLUMN | CDC_SEQUENCE_COLUMN => "TEXT",
+            CDC_MISSING_COLUMNS_COLUMN => "ARRAY",
+            _ => continue,
+        };
+        let metadata: serde_json::Value = serde_json::from_str(typ).map_err(|_| {
+            Error::UnsupportedLayout(format!("Column '{name}' has malformed type metadata"))
+        })?;
+        if metadata.get("type").and_then(serde_json::Value::as_str) != Some(expected)
+            || metadata.get("nullable").and_then(serde_json::Value::as_bool)
+                != Some(*name == CDC_MISSING_COLUMNS_COLUMN)
+            || (*name == CDC_MISSING_COLUMNS_COLUMN
+                && !(default.is_null() || default.as_str() == Some("")))
+        {
+            return Err(Error::UnsupportedLayout(format!(
+                "Column '{name}' does not match the CDC contract"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Validates exact column names without relying on column order.
@@ -491,26 +693,12 @@ fn validate_column_names(
     Ok(())
 }
 
-fn classify_for_retry(error: &Error) -> RetryDecision {
-    match error {
-        Error::HttpTransport(_) => RetryDecision::Retry,
-        Error::HttpStatus { status, .. } => {
-            if *status == StatusCode::REQUEST_TIMEOUT
-                || *status == StatusCode::TOO_MANY_REQUESTS
-                || status.is_server_error()
-            {
-                RetryDecision::Retry
-            } else {
-                RetryDecision::Stop
-            }
-        }
-        _ => RetryDecision::Stop,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+    use crate::snowflake::test_server::{CountingTokenProvider, serve_responses};
 
     /// Token provider used by hermetic SQL client tests.
     struct TestTokenProvider;
@@ -544,9 +732,45 @@ mod tests {
                 num_rows: Some(row_count),
                 row_type: column_names
                     .iter()
-                    .map(|name| ResultColumnMetadata { name: (*name).to_owned() })
+                    .map(|name| ResultColumnMetadata { name: (*name).to_owned(), nullable: None })
                     .collect(),
             }),
+        }
+    }
+
+    /// A token that expires while a statement runs is refreshed once per
+    /// poll, and a second rejection is reported.
+    #[tokio::test]
+    async fn statement_polling_refreshes_rejected_token_once() {
+        for (final_status, final_body) in
+            [(200, r#"{"statementHandle":"test-statement"}"#), (401, "{}")]
+        {
+            // GIVEN: the statement is still running, then Snowflake rejects
+            // the cached token and answers the resent poll.
+            let (url, server) =
+                serve_responses(vec![(202, "{}"), (401, "{}"), (final_status, final_body)]).await;
+            let auth = Arc::new(CountingTokenProvider::default());
+            let config =
+                Config::new("example-account", "test-user", "test-db", "test-schema").unwrap();
+            let client = SqlClient::new(
+                config,
+                Arc::clone(&auth),
+                Client::builder().no_proxy().build().unwrap(),
+            );
+
+            // WHEN: the statement is polled to completion.
+            let polled = client.poll_until_complete(&url, "test-statement").await;
+
+            // THEN: only the rejected poll was resent, with a fresh token.
+            match final_status {
+                200 => assert_eq!(polled.unwrap().statement_handle.unwrap(), "test-statement"),
+                _ => assert!(matches!(
+                    polled,
+                    Err(Error::HttpStatus { status: StatusCode::UNAUTHORIZED, .. })
+                )),
+            }
+            assert_eq!(server.await.unwrap(), vec!["token-0", "token-0", "token-1"]);
+            assert_eq!(auth.invalidations(), 1);
         }
     }
 
@@ -560,6 +784,62 @@ mod tests {
         let columns = parse_show_columns(&response).expect("SHOW COLUMNS should parse");
 
         assert_eq!(columns, vec!["id"]);
+    }
+
+    /// Builds column metadata with deliberately reordered result fields.
+    fn column_response(columns: &[(&str, &str, serde_json::Value)]) -> StatementResponse {
+        statement_response(
+            &["default", "data_type", "column_name"],
+            columns
+                .iter()
+                .map(|(name, typ, default)| vec![default.clone(), json!(typ), json!(name)])
+                .collect(),
+        )
+    }
+
+    /// Only scalar JSON column defaults are migration candidates.
+    #[test]
+    fn json_default_migration_selects_exact_columns() {
+        let response = column_response(&[
+            ("payload", r#"{"type":"VARIANT"}"#, json!("PARSE_JSON('{}')")),
+            ("label", r#"{"type":"TEXT"}"#, json!("'text'")),
+            ("empty", r#"{"type":"VARIANT"}"#, json!("")),
+            ("absent", r#"{"type":"VARIANT"}"#, json!(null)),
+        ]);
+        assert_eq!(
+            json_columns_with_defaults(&response, &["payload", "empty", "absent"]).unwrap(),
+            vec!["payload"]
+        );
+        assert!(json_columns_with_defaults(&response, &["empty", "absent"]).unwrap().is_empty());
+        assert!(json_columns_with_defaults(&response, &[]).unwrap().is_empty());
+    }
+
+    /// Malformed metadata and incompatible types cannot authorize migration.
+    #[test]
+    fn json_default_migration_rejects_invalid_metadata() {
+        for typ in [r#"{"type":"TEXT"}"#, r#"{"type":"ARRAY"}"#] {
+            let response = column_response(&[("payload", typ, json!("'text'"))]);
+            assert!(matches!(
+                json_columns_with_defaults(&response, &["payload"]),
+                Err(Error::Config(_))
+            ));
+        }
+        for typ in ["not-json", "{}", r#"{"type":null}"#, r#"{"type":1}"#] {
+            let response = column_response(&[("payload", typ, json!(null))]);
+            assert!(
+                matches!(json_columns_with_defaults(&response, &["payload"]), Err(Error::Sql { statement_handle: Some(handle), .. }) if handle == "test-statement")
+            );
+        }
+        for default in [json!(false), json!({})] {
+            let response = column_response(&[("payload", r#"{"type":"VARIANT"}"#, default)]);
+            assert!(matches!(
+                json_columns_with_defaults(&response, &["payload"]),
+                Err(Error::Sql { .. })
+            ));
+        }
+        let missing =
+            statement_response(&["column_name"], vec![vec![serde_json::json!("payload")]]);
+        assert!(json_columns_with_defaults(&missing, &["payload"]).is_err());
     }
 
     #[test]
@@ -661,35 +941,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn classify_for_retry_cases() {
-        let cases = [
-            (
-                Error::HttpStatus {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    body: String::new(),
-                },
-                RetryDecision::Retry,
-            ),
-            (
-                Error::HttpStatus { status: StatusCode::TOO_MANY_REQUESTS, body: String::new() },
-                RetryDecision::Retry,
-            ),
-            (
-                Error::HttpStatus { status: StatusCode::REQUEST_TIMEOUT, body: String::new() },
-                RetryDecision::Retry,
-            ),
-            (
-                Error::HttpStatus { status: StatusCode::BAD_REQUEST, body: String::new() },
-                RetryDecision::Stop,
-            ),
-            (Error::Sql { statement_handle: None, message: String::new() }, RetryDecision::Stop),
-        ];
-        for (error, expected) in cases {
-            assert_eq!(classify_for_retry(&error), expected, "error: {error:?}");
-        }
-    }
-
     /// Request-aware statement URLs carry Snowflake's retry parameters.
     #[test]
     fn statement_url_with_request_id_includes_retry_parameters() {
@@ -712,5 +963,62 @@ mod tests {
                 ("retry".to_owned(), "true".to_owned()),
             ]
         );
+    }
+    #[test]
+    fn cdc_metadata_is_paired_by_actual_show_row_and_requires_exact_contract() {
+        let response = |mask_type: &str, nullable: bool, default: serde_json::Value| {
+            statement_response(
+                &["default", "data_type", "column_name"],
+                vec![
+                    vec![
+                        default,
+                        serde_json::json!({"type": mask_type, "nullable": nullable})
+                            .to_string()
+                            .into(),
+                        "_cdc_missing_columns".into(),
+                    ],
+                    vec![
+                        serde_json::Value::Null,
+                        serde_json::json!({"type": "TEXT", "nullable": false}).to_string().into(),
+                        "_cdc_sequence_number".into(),
+                    ],
+                    vec![
+                        serde_json::Value::Null,
+                        serde_json::json!({"type": "FIXED", "nullable": true}).to_string().into(),
+                        "id".into(),
+                    ],
+                    vec![
+                        "".into(),
+                        serde_json::json!({"type": "TEXT", "nullable": false}).to_string().into(),
+                        "_cdc_operation".into(),
+                    ],
+                ],
+            )
+        };
+        for default in [serde_json::Value::Null, "".into()] {
+            let response = response("ARRAY", true, default);
+            let names = parse_show_columns(&response).unwrap();
+            validate_cdc_metadata(&response, &names).unwrap();
+        }
+        for (typ, nullable, default) in
+            [("TEXT", true, ""), ("ARRAY", false, ""), ("ARRAY", true, "ARRAY_CONSTRUCT()")]
+        {
+            let response = response(typ, nullable, default.into());
+            let names = parse_show_columns(&response).unwrap();
+            assert!(matches!(
+                validate_cdc_metadata(&response, &names),
+                Err(Error::UnsupportedLayout(_))
+            ));
+        }
+        let malformed = response("ARRAY", false, "".into());
+        let mut malformed = malformed;
+        malformed.data.as_mut().unwrap()[0][1] = "{invalid".into();
+        assert!(
+            validate_cdc_metadata(&malformed, &parse_show_columns(&malformed).unwrap()).is_err()
+        );
+        let mut response = response("ARRAY", true, "".into());
+        response.data.as_mut().unwrap()[1][1] =
+            serde_json::json!({"type": "TEXT", "nullable": true}).to_string().into();
+        assert!(validate_cdc_metadata(&response, &parse_show_columns(&response).unwrap()).is_err());
     }
 }

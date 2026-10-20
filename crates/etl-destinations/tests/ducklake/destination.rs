@@ -37,7 +37,7 @@ use etl::{
         Destination, DestinationTableMetadata, DestinationTableSchema, DestinationWriteStatus,
         TableCopyAttemptId, TableCopyBatchId,
     },
-    error::{ErrorKind, EtlResult},
+    error::{ErrorKind, EtlResult, Retryability},
     event::{DeleteEvent, Event},
     schema::{
         ColumnSchema, IdentityMask, PgLsn, ReplicatedTableSchema, ReplicationMask, SnapshotId,
@@ -1531,7 +1531,7 @@ async fn buffered_copy_ambiguous_commit_requires_full_recopy() {
         write_table_rows_with_status(&destination, &replicated_table_schema, vec![row.clone()])
             .await
             .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::DestinationAtomicBatchRetryable);
+    assert_eq!(error.retryability(), Retryability::Retryable);
 
     let row_count = count_rows_when_visible(&catalog_url, &data_url, &table_name).await;
     assert_eq!(row_count, 1);
@@ -1544,7 +1544,7 @@ async fn buffered_copy_ambiguous_commit_requires_full_recopy() {
         write_table_rows_with_status(&destination, &replicated_table_schema, vec![row.clone()])
             .await
             .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::DestinationAtomicBatchRetryable);
+    assert_eq!(error.retryability(), Retryability::Retryable);
 
     drop_table_for_copy_with_result(&destination, &replicated_table_schema).await.unwrap();
     store.prepare_table_state_for_copy(schema.id).await.unwrap();
@@ -2895,7 +2895,8 @@ async fn write_events_reveals_publication_column_nullable_without_default() {
     assert_eq!(column_default.as_deref(), Some("NULL"));
 }
 
-/// Applied metadata does not repair an externally modified DuckLake table.
+/// Applied metadata does not repair an externally modified DuckLake table, and
+/// the write stops for an operator instead of retrying.
 #[tokio::test(flavor = "multi_thread")]
 async fn write_events_does_not_reconcile_missing_columns_after_applied_metadata() {
     use etl::event::{InsertEvent, RelationEvent};
@@ -2973,7 +2974,7 @@ async fn write_events_does_not_reconcile_missing_columns_after_applied_metadata(
         .await
         .unwrap_err();
 
-    assert_eq!(error.kind(), ErrorKind::DestinationAtomicBatchRetryable);
+    assert_eq!(error.retryability(), Retryability::Permanent);
 
     let metadata = store.get_destination_table_metadata(old_schema.id).await.unwrap().unwrap();
     assert!(metadata.is_applied());
@@ -3242,7 +3243,8 @@ async fn write_table_rows_preserves_active_column_with_tombstone_prefix() {
     assert_eq!(value, "kept");
 }
 
-/// Restart trusts `Applied` metadata and leaves external schema changes alone.
+/// Restart trusts `Applied` metadata and leaves external schema changes alone;
+/// the write stops for an operator instead of retrying.
 #[tokio::test(flavor = "multi_thread")]
 async fn startup_after_restart_does_not_reconcile_applied_metadata_missing_columns() {
     let lake = create_test_lake(
@@ -3296,7 +3298,7 @@ async fn startup_after_restart_does_not_reconcile_applied_metadata_missing_colum
         .await
         .unwrap_err();
 
-    assert_eq!(error.kind(), ErrorKind::DestinationAtomicBatchRetryable);
+    assert_eq!(error.retryability(), Retryability::Permanent);
 
     let conn = open_lake_conn_when_tables_visible(&catalog_url, &data_url, &[&table_name]).await;
     assert_eq!(table_column_names(&conn, &table_name), vec!["id", "name"]);
@@ -3669,7 +3671,7 @@ async fn startup_after_restart_recovers_creating_metadata() {
 }
 
 /// Restart trusts `Applied` metadata, and ordinary writes surface a missing
-/// table.
+/// table that stops for an operator instead of retrying.
 #[tokio::test(flavor = "multi_thread")]
 async fn startup_after_restart_does_not_recreate_missing_applied_table() {
     let lake = create_test_lake("startup_after_restart_rejects_missing_applied_table").await;
@@ -3703,7 +3705,7 @@ async fn startup_after_restart_does_not_recreate_missing_applied_table() {
         .await
         .unwrap_err();
 
-    assert_eq!(error.kind(), ErrorKind::DestinationAtomicBatchRetryable);
+    assert_eq!(error.retryability(), Retryability::Permanent);
 }
 
 /// Small CDC batches should remain inlined after the caller returns.

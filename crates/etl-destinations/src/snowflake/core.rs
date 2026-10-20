@@ -5,7 +5,7 @@ use std::{
 
 use etl::{
     bail,
-    data::{OldTableRow, TableRow, UpdatedTableRow},
+    data::TableRow,
     destination::{
         DestinationTableMetadata, DestinationTableSchema, DestinationWriteStatus,
         DropTableForCopyResult, TableCopyBatchId, WriteEventsDurability, WriteEventsResult,
@@ -14,10 +14,11 @@ use etl::{
     error::{ErrorKind, EtlError, EtlResult},
     etl_error,
     event::{DeleteEvent, Event, InsertEvent, UpdateEvent},
-    schema::{ColumnSchema, ReplicatedTableSchema, TableId},
+    schema::{ColumnAlterationKind, ColumnSchema, ReplicatedTableSchema, SchemaOperation, TableId},
     store::DestinationStore,
     task::TaskRegistry,
 };
+use futures::{TryStreamExt, stream};
 use tokio::time::timeout;
 use tracing::{info, warn};
 
@@ -26,13 +27,16 @@ use crate::{
     snowflake::{
         Client, SNOWFLAKE_COLUMN_NAME_MAPPING,
         auth::{AuthManager, HttpExchanger, TokenProvider},
-        encoding::{CdcMeta, CdcOperation},
+        encoding::{CdcMeta, CdcOperation, normalize_delete_row, normalize_update_row},
         metrics::register_metrics,
         schema,
-        streaming::{OffsetToken, RestStreamClient, RowBatchBuilder, StreamClient},
+        streaming::{Completed, OffsetToken, RestStreamClient, RowBatchBuilder, StreamClient},
     },
     table_name::try_stringify_table_name,
 };
+
+/// Bounds concurrent remote table/view checks before replication starts.
+const VIEW_STARTUP_CONCURRENCY: usize = 8;
 
 /// Ensures Snowflake metadata is ready for streaming operations.
 fn ensure_snowflake_metadata_applied(
@@ -54,11 +58,51 @@ fn ensure_snowflake_metadata_applied(
     ))
 }
 
+/// Cached Snowflake column definitions and the source schema they came from.
+/// Reused for later events from the same table while their schema is unchanged.
+struct CachedColumns {
+    /// Source schema, including which columns are replicated to Snowflake.
+    schema: ReplicatedTableSchema,
+    /// Snowflake column definitions, ordered to match the values in each row.
+    columns: Vec<ColumnSchema>,
+}
+
 type EventIter = std::iter::Peekable<std::vec::IntoIter<Event>>;
 
 /// Maximum time allowed to drain Snowflake event tasks and retire local table
 /// state before a reset.
 const RESET_PREPARATION_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Groups consecutive row events in first-seen table order without crossing a
+/// relation or truncate barrier. Moving events preserves each table's source
+/// order without cloning its row payloads.
+fn take_data_events(iter: &mut EventIter) -> Vec<(TableId, Vec<Event>)> {
+    let mut table_indexes = HashMap::new();
+    let mut tables: Vec<(TableId, Vec<Event>)> = Vec::new();
+
+    while let Some(event) = iter.peek() {
+        let table_id = match event {
+            Event::Insert(event) => event.replicated_table_schema.id(),
+            Event::Update(event) => event.replicated_table_schema.id(),
+            Event::Delete(event) => event.replicated_table_schema.id(),
+            Event::Relation(_) | Event::Truncate(_) => break,
+            _ => {
+                iter.next();
+                continue;
+            }
+        };
+        let Some(event) = iter.next() else {
+            break;
+        };
+        let index = *table_indexes.entry(table_id).or_insert_with(|| {
+            tables.push((table_id, Vec::new()));
+            tables.len() - 1
+        });
+        tables[index].1.push(event);
+    }
+
+    tables
+}
 
 /// Takes consecutive truncate operations without collapsing distinct source
 /// boundaries. An outcome-unknown earlier truncate must be reconciled before a
@@ -94,7 +138,6 @@ where
 {
     table_schema.validate_destination_column_names(SNOWFLAKE_COLUMN_NAME_MAPPING)?;
     let table_id = table_schema.id();
-    let table_name = try_stringify_table_name(table_schema.name())?.to_uppercase();
     let columns: Vec<_> =
         table_schema.destination_column_schemas(SNOWFLAKE_COLUMN_NAME_MAPPING).collect();
 
@@ -104,11 +147,9 @@ where
         && metadata.is_applied()
     {
         ensure_destination_schema_matches_metadata("Snowflake", table_id, &metadata, table_schema)?;
-        client
-            .prepare_existing_table(table_id, metadata.table_id(), &columns)
-            .await
-            .map_err(EtlError::from)?;
-        return Ok(());
+        if client.is_table_ready(table_id).await {
+            return Ok(());
+        }
     }
 
     // Own the complete Creating -> remote setup -> Applied transition with the
@@ -122,14 +163,20 @@ where
     schema::validate_no_cdc_collisions(&columns).map_err(EtlError::from)?;
     let creating_metadata = match store.get_destination_table_metadata(table_id).await? {
         None => {
+            let table_name = try_stringify_table_name(table_schema.name())?.to_uppercase();
             if client.table_exists(&table_name).await.map_err(EtlError::from)? {
                 bail!(
                     ErrorKind::DestinationTableAlreadyExists,
                     "Snowflake destination table already exists",
                     format!(
-                        "Table {table_name} exists, but this pipeline has no destination metadata \
-                         proving ownership. Remove the table or use another destination schema \
-                         before retrying."
+                        "Cannot create destination table '{table_name}' for source table '{}': \
+                         the destination already exists and is not registered to this source \
+                         table. If it belongs to another renamed source table, resynchronize that \
+                         table first and wait for completion, then retry this one. \
+                         Resynchronization deletes previous destination data and history; source \
+                         rows are copied again only when initial copying is enabled. Otherwise, \
+                         use a new pipeline targeting an unused destination schema.",
+                        table_schema.name()
                     )
                 );
             }
@@ -137,15 +184,15 @@ where
             // Record ownership before creating remote state so a restart can
             // find and remove a partial setup.
             let metadata = DestinationTableMetadata::new_creating(
-                table_name.clone(),
+                table_name,
                 snapshot_id,
                 replication_mask.clone(),
             );
             store.store_destination_table_metadata(table_id, metadata.clone()).await?;
-            Some(metadata)
+            metadata
         }
         Some(metadata) if metadata.is_applied() => {
-            // Another copy partition completed setup while this caller waited.
+            // A source rename does not change the destination this table owns.
             ensure_destination_schema_matches_metadata(
                 "Snowflake",
                 table_id,
@@ -154,6 +201,10 @@ where
             )?;
             client
                 .prepare_table(&table, metadata.table_id(), &columns, false)
+                .await
+                .map_err(EtlError::from)?;
+            client
+                .prepare_view(&table, metadata.table_id(), table_schema)
                 .await
                 .map_err(EtlError::from)?;
             return Ok(());
@@ -167,6 +218,7 @@ where
                 &metadata,
                 table_schema,
             )?;
+            let table_name = try_stringify_table_name(table_schema.name())?.to_uppercase();
             if metadata.table_id() != table_name {
                 bail!(
                     ErrorKind::CorruptedTableSchema,
@@ -179,7 +231,7 @@ where
                 );
             }
 
-            Some(metadata)
+            metadata
         }
         Some(_) => {
             // Applying metadata belongs to schema evolution, which requires its
@@ -196,12 +248,13 @@ where
     };
 
     // Remote setup is retry-safe and remains inside the per-table permit.
-    client.prepare_table(&table, &table_name, &columns, true).await.map_err(EtlError::from)?;
+    let table_name = creating_metadata.table_id();
+    client.prepare_table(&table, table_name, &columns, true).await.map_err(EtlError::from)?;
 
-    // Publish completion only after both the table and channel exist.
-    if let Some(metadata) = creating_metadata {
-        store.store_destination_table_metadata(table_id, metadata.to_applied()).await?;
-    }
+    client.prepare_view(&table, table_name, table_schema).await.map_err(EtlError::from)?;
+
+    // Publish completion only after the table, channel, and view are ready.
+    store.store_destination_table_metadata(table_id, creating_metadata.to_applied()).await?;
 
     Ok(())
 }
@@ -300,18 +353,11 @@ where
             })?;
         ensure_snowflake_metadata_applied(table_id, &metadata)?;
         ensure_destination_schema_matches_metadata("Snowflake", table_id, &metadata, table_schema)?;
-
-        if self.client.has_channel(table_id).await {
+        if self.client.is_table_ready(table_id).await {
             return Ok(());
         }
 
-        table_schema.validate_destination_column_names(SNOWFLAKE_COLUMN_NAME_MAPPING)?;
-        let columns: Vec<_> =
-            table_schema.destination_column_schemas(SNOWFLAKE_COLUMN_NAME_MAPPING).collect();
-        self.client
-            .prepare_existing_table(table_id, metadata.table_id(), &columns)
-            .await
-            .map_err(EtlError::from)?;
+        self.initialize_table(table_schema).await?;
 
         Ok(())
     }
@@ -332,8 +378,7 @@ where
         let mut requires_durability_wait = false;
 
         while iter.peek().is_some() {
-            let builders = self.accumulate_data_events(&mut iter).await?;
-            self.flush_batches(builders).await?;
+            self.write_data_events(&mut iter).await?;
             requires_durability_wait |= self.apply_relation_events(&mut iter).await?;
             requires_durability_wait |= self.apply_truncate_events(&mut iter).await?;
         }
@@ -348,38 +393,41 @@ where
         }
     }
 
-    async fn accumulate_data_events(
-        &self,
-        iter: &mut EventIter,
-    ) -> EtlResult<HashMap<TableId, RowBatchBuilder>> {
-        let mut builders: HashMap<TableId, RowBatchBuilder> = HashMap::new();
-        let mut column_cache: HashMap<TableId, Vec<ColumnSchema>> = HashMap::new();
+    /// Encodes one table at a time within each data segment.
+    ///
+    /// A stream compressor has substantial native state even for a tiny row.
+    /// Finish each table before starting the next so the number of tables in
+    /// the source batch does not multiply live compressor memory. Completed
+    /// requests are sent immediately, preserving per-table order and packing.
+    async fn write_data_events(&self, iter: &mut EventIter) -> EtlResult<()> {
+        for (table_id, events) in take_data_events(iter) {
+            let mut builder = RowBatchBuilder::new(table_id);
+            let mut columns = None;
 
-        // Consume data events (insert/update/delete) into per-table batch
-        // builders, stopping at barrier events (truncate, relation) that
-        // require a flush before they can be applied.
-        while let Some(event) = iter.peek() {
-            if matches!(event, Event::Truncate(_) | Event::Relation(_)) {
-                break;
+            for event in events {
+                let completed = match event {
+                    Event::Insert(event) => {
+                        self.encode_insert(event, &mut builder, &mut columns).await?
+                    }
+                    Event::Update(event) => {
+                        self.encode_update(event, &mut builder, &mut columns).await?
+                    }
+                    Event::Delete(event) => {
+                        self.encode_delete(event, &mut builder, &mut columns).await?
+                    }
+                    _ => unreachable!("data groups contain only row events"),
+                };
+                for batch in completed {
+                    self.client
+                        .send_streaming_batch(table_id, batch)
+                        .await
+                        .map_err(EtlError::from)?;
+                }
             }
-            let Some(event) = iter.next() else {
-                break;
-            };
-            match event {
-                Event::Insert(e) => self.encode_insert(e, &mut builders, &mut column_cache).await?,
-                Event::Update(e) => self.encode_update(e, &mut builders, &mut column_cache).await?,
-                Event::Delete(e) => self.encode_delete(e, &mut builders, &mut column_cache).await?,
-                _ => {}
+
+            for batch in builder.finish().map_err(EtlError::from)? {
+                self.client.send_streaming_batch(table_id, batch).await.map_err(EtlError::from)?;
             }
-        }
-
-        Ok(builders)
-    }
-
-    async fn flush_batches(&self, builders: HashMap<TableId, RowBatchBuilder>) -> EtlResult<()> {
-        for (table_id, builder) in builders {
-            let batches = builder.finish().map_err(EtlError::from)?;
-            self.client.send_streaming_batches(table_id, batches).await.map_err(EtlError::from)?;
         }
         Ok(())
     }
@@ -407,24 +455,21 @@ where
         Ok(had_truncates)
     }
 
+    /// Encodes an insert row, returning the request it completed, if any.
     async fn encode_insert(
         &self,
         e: InsertEvent,
-        builders: &mut HashMap<TableId, RowBatchBuilder>,
-        column_cache: &mut HashMap<TableId, Vec<ColumnSchema>>,
-    ) -> EtlResult<()> {
+        builder: &mut RowBatchBuilder,
+        columns: &mut Option<CachedColumns>,
+    ) -> EtlResult<Completed> {
         let table_id = e.replicated_table_schema.id();
-        self.ensure_column_cache(column_cache, table_id, &e.replicated_table_schema).await?;
-
-        let cols = &column_cache[&table_id];
+        let cols = self.prepare_columns(columns, &e.replicated_table_schema).await?;
         let offset = OffsetToken::new(e.commit_lsn, e.tx_ordinal);
         if self.client.is_offset_committed(table_id, &offset).await.map_err(EtlError::from)? {
-            return Ok(());
+            return Ok(Completed::default());
         }
 
-        builders
-            .entry(table_id)
-            .or_default()
+        builder
             .push_row(
                 cols,
                 &e.table_row,
@@ -434,91 +479,92 @@ where
             .map_err(EtlError::from)
     }
 
+    /// Encodes an update row, returning the request it completed, if any.
     async fn encode_update(
         &self,
         e: UpdateEvent,
-        builders: &mut HashMap<TableId, RowBatchBuilder>,
-        column_cache: &mut HashMap<TableId, Vec<ColumnSchema>>,
-    ) -> EtlResult<()> {
-        let full_row = snowflake_update_row(&e.replicated_table_schema, e.updated_table_row)?;
+        builder: &mut RowBatchBuilder,
+        columns: &mut Option<CachedColumns>,
+    ) -> EtlResult<Completed> {
+        let (full_row, missing) =
+            normalize_update_row(&e.replicated_table_schema, e.updated_table_row, e.old_table_row)
+                .map_err(EtlError::from)?;
 
         let table_id = e.replicated_table_schema.id();
-        self.ensure_column_cache(column_cache, table_id, &e.replicated_table_schema).await?;
-
-        let cols = &column_cache[&table_id];
+        let cols = self.prepare_columns(columns, &e.replicated_table_schema).await?;
         let offset = OffsetToken::new(e.commit_lsn, e.tx_ordinal);
         if self.client.is_offset_committed(table_id, &offset).await.map_err(EtlError::from)? {
-            return Ok(());
+            return Ok(Completed::default());
         }
 
-        builders
-            .entry(table_id)
-            .or_default()
-            .push_row(cols, &full_row, CdcMeta::new(CdcOperation::Update, offset.as_ref()), &offset)
+        builder
+            .push_row(
+                cols,
+                &full_row,
+                CdcMeta::new(CdcOperation::Update, offset.as_ref()).with_missing_columns(&missing),
+                &offset,
+            )
             .map_err(EtlError::from)
     }
 
+    /// Encodes a delete row, returning the request it completed, if any.
     async fn encode_delete(
         &self,
         e: DeleteEvent,
-        builders: &mut HashMap<TableId, RowBatchBuilder>,
-        column_cache: &mut HashMap<TableId, Vec<ColumnSchema>>,
-    ) -> EtlResult<()> {
+        builder: &mut RowBatchBuilder,
+        columns: &mut Option<CachedColumns>,
+    ) -> EtlResult<Completed> {
         let table_id = e.replicated_table_schema.id();
         let offset = OffsetToken::new(e.commit_lsn, e.tx_ordinal);
-        self.ensure_column_cache(column_cache, table_id, &e.replicated_table_schema).await?;
+        let cols = self.prepare_columns(columns, &e.replicated_table_schema).await?;
         if self.client.is_offset_committed(table_id, &offset).await.map_err(EtlError::from)? {
-            return Ok(());
+            return Ok(Completed::default());
         }
 
-        match snowflake_delete_row(&e.replicated_table_schema, e.old_table_row)? {
-            SnowflakeDeleteRow::Full(row) => {
-                let cols = &column_cache[&table_id];
-                builders
-                    .entry(table_id)
-                    .or_default()
-                    .push_row(
-                        cols,
-                        &row,
-                        CdcMeta::new(CdcOperation::Delete, offset.as_ref()),
-                        &offset,
-                    )
-                    .map_err(EtlError::from)
-            }
-            SnowflakeDeleteRow::Key(key_row) => {
-                let identity_cols: Vec<_> = e
-                    .replicated_table_schema
-                    .identity_column_schemas()
-                    .map(|column| SNOWFLAKE_COLUMN_NAME_MAPPING.map_column_schema(column))
-                    .collect();
-                builders
-                    .entry(table_id)
-                    .or_default()
-                    .push_row(
-                        &identity_cols,
-                        &key_row,
-                        CdcMeta::new(CdcOperation::Delete, offset.as_ref()),
-                        &offset,
-                    )
-                    .map_err(EtlError::from)
-            }
-        }
+        let (row, missing) = normalize_delete_row(&e.replicated_table_schema, e.old_table_row)
+            .map_err(EtlError::from)?;
+        builder
+            .push_row(
+                cols,
+                &row,
+                CdcMeta::new(CdcOperation::Delete, offset.as_ref()).with_missing_columns(&missing),
+                &offset,
+            )
+            .map_err(EtlError::from)
     }
 
-    async fn ensure_column_cache(
+    /// Prepares the table and reuses its columns while the source schema is
+    /// unchanged.
+    async fn prepare_columns<'a>(
         &self,
-        column_cache: &mut HashMap<TableId, Vec<ColumnSchema>>,
-        table_id: TableId,
+        columns: &'a mut Option<CachedColumns>,
         table_schema: &ReplicatedTableSchema,
-    ) -> EtlResult<()> {
-        #[expect(clippy::map_entry)]
-        if !column_cache.contains_key(&table_id) {
-            self.prepare_table_for_writes(table_schema).await?;
-            let cols: Vec<_> =
-                table_schema.destination_column_schemas(SNOWFLAKE_COLUMN_NAME_MAPPING).collect();
-            column_cache.insert(table_id, cols);
+    ) -> EtlResult<&'a [ColumnSchema]> {
+        match columns {
+            Some(cached) => {
+                // The snapshot identifies the table definition; the replicated
+                // column selection can change separately.
+                if cached.schema.inner().snapshot_id != table_schema.inner().snapshot_id
+                    || cached.schema.replication_mask() != table_schema.replication_mask()
+                {
+                    bail!(
+                        ErrorKind::DestinationLayoutUnsupported,
+                        "Snowflake data segment contains multiple schema snapshots or projections"
+                    );
+                }
+                Ok(&cached.columns)
+            }
+            None => {
+                self.prepare_table_for_writes(table_schema).await?;
+                let cached = columns.insert(CachedColumns {
+                    schema: table_schema.clone(),
+                    columns: table_schema
+                        .destination_column_schemas(SNOWFLAKE_COLUMN_NAME_MAPPING)
+                        .collect(),
+                });
+                Ok(&cached.columns)
+            }
         }
-        Ok(())
     }
 
     async fn handle_relation_event(&self, new_schema: &ReplicatedTableSchema) -> EtlResult<bool> {
@@ -554,6 +600,7 @@ where
         )?;
 
         if current_snapshot_id == new_snapshot_id {
+            self.initialize_table(new_schema).await?;
             info!(table_id = ?table_id, "schema unchanged, skipping relation event");
             return Ok(false);
         }
@@ -598,6 +645,18 @@ where
         let plan = current_schema.plan_schema_change(new_schema, SNOWFLAKE_COLUMN_NAME_MAPPING)?;
         self.client.wait_for_pending_durability().await.map_err(EtlError::from)?;
 
+        let table = self.client.lock_table(table_id).await;
+        self.client.invalidate_view(&table).await;
+        if plan.ordered_operations().iter().any(|operation| match operation {
+            SchemaOperation::DropColumn { .. } => true,
+            SchemaOperation::AlterColumn { alteration } => {
+                alteration.kind() == ColumnAlterationKind::Rename
+            }
+            _ => false,
+        }) {
+            self.client.park_view(&table, &table_name).await.map_err(EtlError::from)?;
+        }
+
         let updated_metadata = DestinationTableMetadata::new_applied(
             metadata.table_id().to_owned(),
             current_snapshot_id,
@@ -622,56 +681,12 @@ where
             .store_destination_table_metadata(table_id, updated_metadata.to_applied())
             .await?;
 
+        // Raw schema completion is durable before derived-view work. Failure
+        // here retries view reconciliation without replaying successful DDL.
+        self.client.prepare_view(&table, &table_name, new_schema).await.map_err(EtlError::from)?;
+
         info!(table_id = ?table_id, "schema change applied");
         Ok(true)
-    }
-}
-
-/// Delete row payloads Snowflake can encode.
-#[derive(Debug)]
-enum SnowflakeDeleteRow {
-    /// A full old row image.
-    Full(TableRow),
-    /// A key-only old row image.
-    Key(TableRow),
-}
-
-/// Returns the full new row required for a Snowflake update row.
-fn snowflake_update_row(
-    replicated_table_schema: &ReplicatedTableSchema,
-    updated_table_row: UpdatedTableRow,
-) -> EtlResult<TableRow> {
-    match updated_table_row {
-        UpdatedTableRow::Full(row) => Ok(row),
-        UpdatedTableRow::Partial(_) => Err(etl_error!(
-            ErrorKind::SourceReplicaIdentityError,
-            "Snowflake update requires a full new row image",
-            format!(
-                "Table '{}' emitted a partial update row. Snowflake update rows must include all \
-                 replicated column values.",
-                replicated_table_schema.name()
-            )
-        )),
-    }
-}
-
-/// Returns the old row image required for a Snowflake delete row.
-fn snowflake_delete_row(
-    replicated_table_schema: &ReplicatedTableSchema,
-    old_table_row: Option<OldTableRow>,
-) -> EtlResult<SnowflakeDeleteRow> {
-    match old_table_row {
-        Some(OldTableRow::Full(row)) => Ok(SnowflakeDeleteRow::Full(row)),
-        Some(OldTableRow::Key(row)) => Ok(SnowflakeDeleteRow::Key(row)),
-        None => Err(etl_error!(
-            ErrorKind::SourceReplicaIdentityError,
-            "Snowflake delete requires an old row image",
-            format!(
-                "Table '{}' emitted a delete without an old row image. Snowflake deletes need \
-                 either a full old row or a key image.",
-                replicated_table_schema.name()
-            )
-        )),
     }
 }
 
@@ -685,6 +700,61 @@ where
         etl_config::shared::DestinationKind::Snowflake.as_str()
     }
 
+    async fn startup(&self) -> EtlResult<()> {
+        // Incomplete syncs restart from a fresh copy. Their retained metadata
+        // identifies old objects for cleanup, not tables to prepare for writes.
+        let table_ids = self
+            .writer
+            .store
+            .get_table_states()
+            .await?
+            .iter()
+            .filter_map(|(table_id, state)| {
+                state.as_type().has_completed_table_sync().then_some(*table_id)
+            })
+            .collect::<Vec<_>>();
+        stream::iter(table_ids.into_iter().map(Ok))
+            .try_for_each_concurrent(VIEW_STARTUP_CONCURRENCY, |table_id| async move {
+                let Some(metadata) =
+                    self.writer.store.get_destination_table_metadata(table_id).await?
+                else {
+                    return Ok(());
+                };
+                // Never publish a view over interrupted raw DDL.
+                if !metadata.is_applied() {
+                    return Ok(());
+                }
+                let schema = self
+                    .writer
+                    .store
+                    .get_table_schema(&table_id, metadata.snapshot_id())
+                    .await?
+                    .ok_or_else(|| {
+                        etl_error!(
+                            ErrorKind::InvalidState,
+                            "Stored schema missing for Snowflake view reconciliation"
+                        )
+                    })?;
+                let schema =
+                    ReplicatedTableSchema::from_mask(schema, metadata.replication_mask().clone());
+                schema.validate_destination_column_names(SNOWFLAKE_COLUMN_NAME_MAPPING)?;
+                let columns: Vec<_> =
+                    schema.destination_column_schemas(SNOWFLAKE_COLUMN_NAME_MAPPING).collect();
+                let table = self.writer.client.lock_table(table_id).await;
+                self.writer
+                    .client
+                    .prepare_existing_schema(metadata.table_id(), &columns)
+                    .await
+                    .map_err(EtlError::from)?;
+                self.writer
+                    .client
+                    .prepare_view(&table, metadata.table_id(), &schema)
+                    .await
+                    .map_err(EtlError::from)
+            })
+            .await
+    }
+
     async fn shutdown(&self) -> EtlResult<()> {
         self.tasks.shutdown().await
     }
@@ -694,26 +764,48 @@ where
         replicated_table_schema: &ReplicatedTableSchema,
         async_result: DropTableForCopyResult<()>,
     ) -> EtlResult<()> {
-        let table_name = try_stringify_table_name(replicated_table_schema.name())?.to_uppercase();
         let (task_guard, detached) = timeout(RESET_PREPARATION_TIMEOUT, async {
             // Acquire the task registry before any client lock. Event tasks
             // have no registry access, so they can finish while reset waits for
             // them.
             let task_guard = self.tasks.drain().await?;
+
+            // A source rename changes the schema name but not the destination
+            // this table owns. Use the same durable target for channel and
+            // table deletion, including when no channel is cached
+            // after a restart.
+            let metadata = self
+                .writer
+                .store
+                .get_destination_table_metadata(replicated_table_schema.id())
+                .await?;
+            let table_name = metadata.as_ref().map_or_else(
+                || {
+                    try_stringify_table_name(replicated_table_schema.name())
+                        .map(|name| name.to_uppercase())
+                },
+                |metadata| Ok(metadata.table_id().to_owned()),
+            )?;
             let detached = self
                 .writer
                 .client
-                .detach_table_for_copy(replicated_table_schema.id(), &table_name)
+                .detach_table_for_copy(
+                    replicated_table_schema.id(),
+                    &table_name,
+                    metadata.is_some(),
+                    try_stringify_table_name(replicated_table_schema.name())
+                        .is_ok_and(|name| table_name == name.to_uppercase()),
+                )
                 .await
                 .map_err(EtlError::from)?;
             Ok::<_, EtlError>((task_guard, detached))
         })
         .await
-        .map_err(|error| {
+        .map_err(|_| {
             etl_error!(
                 ErrorKind::DestinationTimeout,
                 "Snowflake table reset preparation timed out",
-                source: error
+                format!("reset preparation did not finish within {RESET_PREPARATION_TIMEOUT:?}")
             )
         })??;
 
@@ -756,12 +848,12 @@ where
                 .destination_column_schemas(SNOWFLAKE_COLUMN_NAME_MAPPING)
                 .collect();
 
-            // Build row batches. Snowflake has limits on max size of input, so
-            // we slice into proper batches, when necessary.
+            // Encode rows one at a time and send each request as it completes,
+            // so encoded output never accumulates for the whole copy batch.
             let zero = OffsetToken::zero();
-            let mut builder = RowBatchBuilder::new();
+            let mut builder = RowBatchBuilder::new(table_id);
             for row in &table_rows {
-                builder
+                let completed = builder
                     .push_row(
                         &columns,
                         row,
@@ -769,14 +861,22 @@ where
                         &zero,
                     )
                     .map_err(EtlError::from)?;
+                for batch in completed {
+                    self.writer
+                        .client
+                        .send_table_copy_batch(table_id, batch)
+                        .await
+                        .map_err(EtlError::from)?;
+                }
             }
 
-            let batches = builder.finish().map_err(EtlError::from)?;
-            self.writer
-                .client
-                .send_table_copy_batches(table_id, batches)
-                .await
-                .map_err(EtlError::from)?;
+            for batch in builder.finish().map_err(EtlError::from)? {
+                self.writer
+                    .client
+                    .send_table_copy_batch(table_id, batch)
+                    .await
+                    .map_err(EtlError::from)?;
+            }
 
             Ok(DestinationWriteStatus::Accepted)
         }
@@ -830,11 +930,11 @@ mod tests {
     };
 
     use etl::{
-        data::{Cell, PartialTableRow},
+        destination::Destination as _,
         event::{RelationEvent, TruncateEvent},
         pipeline::PipelineId,
         schema::{IdentityMask, PgLsn, ReplicationMask, SnapshotId, TableName, TableSchema, Type},
-        store::StateStore,
+        store::{SchemaStore, StateStore, TableRetryPolicy, TableState},
         test_utils::notifying_store::NotifyingStore,
     };
 
@@ -930,6 +1030,80 @@ mod tests {
         assert!(matches!(iter.next(), Some(Event::Unsupported)));
     }
 
+    /// Startup only prepares destinations whose initial synchronization
+    /// completed.
+    #[tokio::test]
+    async fn startup_skips_incomplete_and_errored_tables() {
+        let (destination, store) = test_destination();
+        let schema = replicated_schema();
+        store.store_table_schema(schema.inner().clone()).await.unwrap();
+        store
+            .store_destination_table_metadata(
+                schema.id(),
+                DestinationTableMetadata::new_applied(
+                    "PUBLIC_USERS".into(),
+                    schema.inner().snapshot_id,
+                    schema.replication_mask().clone(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        for state in [
+            TableState::Init,
+            TableState::DataSync,
+            TableState::FinishedCopy,
+            TableState::Errored {
+                reason: "Test failure".into(),
+                solution: None,
+                retry_policy: TableRetryPolicy::ManualRetry,
+                source_err: etl_error!(ErrorKind::Unknown, "Test failure"),
+            },
+        ] {
+            store.update_table_state(schema.id(), state).await.unwrap();
+            destination.startup().await.unwrap();
+        }
+
+        // Completed tables must still reach remote preparation. The test token
+        // provider deliberately rejects that request before any network call.
+        for state in [
+            TableState::SyncDone { lsn: 0_u64.into(), table_decoding_state: None },
+            TableState::Ready,
+        ] {
+            store.update_table_state(schema.id(), state).await.unwrap();
+            let error = destination.startup().await.unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::DestinationAuthenticationError);
+        }
+    }
+
+    /// An owned table can reopen even when its renamed source cannot map to a
+    /// new target.
+    #[tokio::test]
+    async fn applied_table_reopens_without_remapping_source_name() {
+        let (destination, store) = test_destination();
+        let mut renamed = (*replicated_schema().inner()).clone();
+        renamed.name = TableName::new("public".into(), "renamed\"source".into());
+        let schema = ReplicatedTableSchema::all(Arc::new(renamed));
+
+        let error = destination.writer.initialize_table(&schema).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ValidationError);
+        assert!(store.get_destination_table_metadata(schema.id()).await.unwrap().is_none());
+
+        store
+            .store_destination_table_metadata(
+                schema.id(),
+                DestinationTableMetadata::new_applied(
+                    "PUBLIC_USERS".into(),
+                    schema.inner().snapshot_id,
+                    schema.replication_mask().clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        let error = destination.writer.initialize_table(&schema).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DestinationAuthenticationError);
+    }
+
     #[tokio::test]
     async fn initial_setup_failure_leaves_metadata_creating() {
         let (destination, store) = test_destination();
@@ -1005,7 +1179,7 @@ mod tests {
         else {
             panic!("initialization should not reacquire its table gate");
         };
-        assert_eq!(result.unwrap_err().kind(), ErrorKind::DestinationError);
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::DestinationAuthenticationError);
         assert!(
             store.get_destination_table_metadata(schema.id()).await.unwrap().unwrap().is_applied()
         );
@@ -1089,59 +1263,30 @@ mod tests {
         assert_eq!(store.get_destination_table_metadata(table_id).await.unwrap(), Some(metadata));
     }
 
-    #[test]
-    fn snowflake_update_row_accepts_full_new_row() {
+    /// Cache reuse requires the same source schema and the same set of
+    /// replicated columns.
+    #[tokio::test]
+    async fn column_cache_rejects_changed_snapshot_or_projection() {
+        let (destination, _) = test_destination();
         let schema = replicated_schema();
-        let row = TableRow::new(vec![Cell::I32(1), Cell::String("alice".to_owned())]);
-
-        let result = snowflake_update_row(&schema, UpdatedTableRow::Full(row.clone())).unwrap();
-
-        assert_eq!(result, row);
-    }
-
-    #[test]
-    fn snowflake_update_row_rejects_partial_new_row() {
-        let schema = replicated_schema();
-        let partial_row = PartialTableRow::new(2, TableRow::new(vec![Cell::I32(1)]), vec![1]);
-
-        let error =
-            snowflake_update_row(&schema, UpdatedTableRow::Partial(partial_row)).unwrap_err();
-
-        assert_eq!(error.kind(), ErrorKind::SourceReplicaIdentityError);
-    }
-
-    #[test]
-    fn snowflake_delete_row_accepts_full_old_row() {
-        let schema = replicated_schema();
-        let row = TableRow::new(vec![Cell::I32(1), Cell::String("alice".to_owned())]);
-
-        let result = snowflake_delete_row(&schema, Some(OldTableRow::Full(row.clone()))).unwrap();
-
-        match result {
-            SnowflakeDeleteRow::Full(result) => assert_eq!(result, row),
-            SnowflakeDeleteRow::Key(_) => panic!("expected full old row"),
+        let mut cache = Some(CachedColumns {
+            schema: schema.clone(),
+            columns: schema.column_schemas().cloned().collect(),
+        });
+        destination.writer.prepare_columns(&mut cache, &schema).await.unwrap();
+        let mut changed = schema.inner().clone();
+        changed.snapshot_id = test_snapshot_id(10, 1);
+        for changed in [
+            ReplicatedTableSchema::all(Arc::new(changed)),
+            ReplicatedTableSchema::from_mask(
+                Arc::new(schema.inner().clone()),
+                ReplicationMask::from_bytes(vec![1, 0]),
+            ),
+        ] {
+            assert_eq!(
+                destination.writer.prepare_columns(&mut cache, &changed).await.unwrap_err().kind(),
+                ErrorKind::DestinationLayoutUnsupported
+            );
         }
-    }
-
-    #[test]
-    fn snowflake_delete_row_accepts_key_only_old_row() {
-        let schema = replicated_schema();
-        let row = TableRow::new(vec![Cell::I32(1)]);
-
-        let result = snowflake_delete_row(&schema, Some(OldTableRow::Key(row.clone()))).unwrap();
-
-        match result {
-            SnowflakeDeleteRow::Key(result) => assert_eq!(result, row),
-            SnowflakeDeleteRow::Full(_) => panic!("expected key old row"),
-        }
-    }
-
-    #[test]
-    fn snowflake_delete_row_rejects_missing_old_row() {
-        let schema = replicated_schema();
-
-        let error = snowflake_delete_row(&schema, None).unwrap_err();
-
-        assert_eq!(error.kind(), ErrorKind::SourceReplicaIdentityError);
     }
 }

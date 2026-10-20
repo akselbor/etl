@@ -2,6 +2,7 @@ mod batches;
 mod client;
 mod config;
 mod core;
+mod duckdb_error;
 mod encoding;
 mod external_maintenance;
 mod inline_size;
@@ -13,12 +14,13 @@ mod sql;
 use std::fmt;
 
 use etl::{
-    error::{ErrorKind, EtlResult},
-    etl_error,
+    error::{ErrorKind, EtlResult, Retryability},
     schema::{ColumnNameMapping, TableName},
 };
 pub use etl_config::shared::DuckLakeWriterConfig;
 use serde::{Deserialize, Serialize};
+
+use crate::retry::{ClassifiedError, classified_error, classified_error_with_detail};
 
 /// The DuckDB catalog alias used in every `lake.<table>` qualified name.
 pub(super) const LAKE_CATALOG: &str = "lake";
@@ -29,6 +31,13 @@ pub(super) const LAKE_CATALOG: &str = "lake";
 /// mapping. Changing it for existing tables requires compatibility handling or
 /// a resync.
 const DUCKLAKE_COLUMN_NAME_MAPPING: ColumnNameMapping = ColumnNameMapping::AsciiLowercase;
+
+/// Destination metadata serializes and parses the same way every time.
+impl ClassifiedError for serde_json::Error {
+    fn retryability(&self) -> Retryability {
+        Retryability::Permanent
+    }
+}
 
 /// A table reference inside the DuckLake catalog.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
@@ -66,10 +75,10 @@ impl DuckLakeTableName {
     /// Serializes this reference for durable destination metadata.
     pub fn to_metadata_id(&self) -> EtlResult<String> {
         serde_json::to_string(self).map_err(|source| {
-            etl_error!(
+            classified_error(
                 ErrorKind::InvalidState,
                 "DuckLake destination table metadata serialization failed",
-                source: source
+                source,
             )
         })
     }
@@ -77,11 +86,11 @@ impl DuckLakeTableName {
     /// Parses a durable destination metadata table reference.
     pub(super) fn from_metadata_id(value: &str) -> EtlResult<Self> {
         serde_json::from_str(value).map_err(|source| {
-            etl_error!(
+            classified_error_with_detail(
                 ErrorKind::InvalidState,
                 "DuckLake destination table metadata is invalid",
                 format!("destination_table_id={value}"),
-                source: source
+                source,
             )
         })
     }

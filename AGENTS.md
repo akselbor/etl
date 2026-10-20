@@ -266,8 +266,10 @@ cleanup. Recovery correctness still applies: never checkpoint unfinished work.
   alive when requesting shutdown, then await it to finish cleanup.
 - **Apply:** stop intake and drain buffered batches and pending write results
   under existing deadlines, durability, and error policies. Do not force early
-  flushes or cancel in-flight apply writes. Coordination waits must observe
-  shutdown when a stopping worker may never publish the awaited state.
+  flushes or cancel in-flight apply writes. `drain_on_shutdown = false` is the
+  one opt-out: it abandons that work unacknowledged, for replay after restart.
+  Coordination waits must observe shutdown when a stopping worker may never
+  publish the awaited state.
 - **Copy and startup:** initial sync is replayable. Keep copy waits, including
   the final empty write and its result, cancellable. On controlled shutdown,
   abort and join copy children before releasing the snapshot. Cancel startup
@@ -328,13 +330,19 @@ intent in a preceding comment. Prefer assertions without custom messages. A
 message is justified only for non-sensitive runtime context the default output
 lacks (table-driven case ids). Add or update tests when behavior changes.
 Reuse `crates/etl/src/test_utils/` and nearby helpers before inventing setup.
+Move helpers used by multiple test files into the appropriate shared test
+module; keep file-specific helpers at the top of their test file.
 
 Register `NotifyingStore::notify_on_*` and `TestDestinationWrapper::wait_for_*`
-**before** the producer can fire (they only arm on later updates):
+**before** the producer can fire (they only arm on later updates). Separate
+notification registration, triggering work, and notification waits with blank
+lines so the synchronization phases are clear:
 
 ```rust
 let ready = store.notify_on_table_state_type(id, Ready).await;
+
 pipeline.start().await.unwrap();
+
 ready.notified().await;
 ```
 

@@ -4,11 +4,16 @@ mod config;
 mod core;
 mod encoding;
 mod error;
+mod materialization;
 mod metrics;
 mod schema;
 mod sql;
 mod sql_client;
 mod streaming;
+mod view;
+
+#[cfg(test)]
+mod test_server;
 
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
@@ -29,6 +34,12 @@ pub use auth::{AuthManager, HttpExchanger, TokenProvider};
 pub use client::Client;
 pub use config::Config;
 pub use encoding::{CdcMeta, CdcOperation};
-pub use error::{Error, Result, SnowpipeError};
+pub use error::{Error, LargestColumn, Result, SnowpipeError};
+pub use materialization::materialization_query;
 pub use sql_client::SqlClient;
-pub use streaming::{OffsetToken, RestStreamClient, RowBatch, RowBatchBuilder, StreamClient};
+#[cfg(feature = "test-utils")]
+pub use streaming::BuilderFootprint;
+pub use streaming::{
+    ChannelStatusResponse, Completed, InsertRowsResponse, OffsetToken, OpenChannelResponse,
+    RestStreamClient, RowBatch, RowBatchBuilder, StreamClient,
+};
