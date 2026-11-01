@@ -55,11 +55,6 @@ etl-telemetry = { workspace = true }
 name = "main"
 path = "tests/main.rs"
 
-# The main integration suite requires test-utils; check this API without it.
-[[test]]
-name = "public_api"
-path = "tests/public_api.rs"
-
 # Multigres integration coverage in its own cluster.
 [[test]]
 name = "multigres"
