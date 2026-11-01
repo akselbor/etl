@@ -57,6 +57,19 @@ superuser. Either run the pipeline as a superuser, or apply the source
 migrations in `crates/etl/migrations/source/` as an admin and set
 `run_source_migrations: false`.
 
+For embedded applications, call `etl::run_source_migrations(&admin_config).await?`
+from your provisioning command. This uses the source migrations bundled with
+the same ETL dependency as the runtime pipeline and does not require `test-utils`.
+After administrator provisioning, grant the replication role access to the helpers:
+
+```sql
+grant usage on schema etl to etl_user;
+grant execute on function etl.describe_table_schema(oid),
+    etl.describe_table_identity(oid) to etl_user;
+```
+
+Reapply these grants after provisioning because migrations can recreate functions.
+
 ## Replication Slots
 
 A replication slot records a consumer's progress and retains the WAL it still

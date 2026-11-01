@@ -117,7 +117,10 @@ async fn run_migration_set(
 ///
 /// [`crate::pipeline::Pipeline::start`] runs these migrations automatically.
 /// This function is public for applications that want to preflight or pre-apply
-/// the source-side setup.
+/// the source-side setup using an administrator connection. Creating the DDL
+/// event trigger requires superuser privileges. After provisioning, configure
+/// the runtime pipeline with `run_source_migrations: false` to run replication
+/// as a non-superuser.
 pub async fn run_source_migrations(source_config: &PgConnectionConfig) -> EtlResult<()> {
     let in_recovery = source_database_in_recovery(source_config).await.map_err(|err| {
         etl_error!(
