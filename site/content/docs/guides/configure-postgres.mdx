@@ -63,9 +63,9 @@ the same ETL dependency as the runtime pipeline and does not require `test-utils
 After administrator provisioning, grant the replication role access to the helpers:
 
 ```sql
-GRANT USAGE ON SCHEMA etl TO etl_user;
-GRANT EXECUTE ON FUNCTION etl.describe_table_schema(oid),
-    etl.describe_table_identity(oid) TO etl_user;
+grant usage on schema etl to etl_user;
+grant execute on function etl.describe_table_schema(oid),
+    etl.describe_table_identity(oid) to etl_user;
 ```
 
 Reapply these grants after provisioning because migrations can recreate functions.
