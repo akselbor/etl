@@ -88,6 +88,9 @@ jobs:
           RUSTFLAGS: --cfg tokio_unstable
         run: cargo clippy --locked --workspace --all-targets --all-features --no-deps -- -D warnings
 
+      - name: Check public setup API without test utilities
+        run: cargo test --locked -p etl --test public_api
+
       - name: Check fuzz crate
         # Fuzz is a separate workspace without a committed Cargo.lock.
         run: cargo check --manifest-path fuzz/Cargo.toml

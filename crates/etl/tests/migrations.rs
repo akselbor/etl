@@ -6,7 +6,8 @@ use etl::{
         PgConnectionConfig, PgConnectionOptions, PipelineConfig, TableSyncCopyConfig,
     },
     pipeline::Pipeline,
-    postgres::migrations::{ETL_SCHEMA_LOCK_ID, run_source_migrations},
+    postgres::migrations::ETL_SCHEMA_LOCK_ID,
+    run_source_migrations,
     store::{MemoryStore, PostgresStore},
     test_utils::memory_destination::MemoryDestination,
 };

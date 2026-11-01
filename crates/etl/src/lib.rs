@@ -235,6 +235,7 @@ pub mod fuzzing;
 mod macros;
 mod observability;
 pub mod pipeline;
+pub use postgres::migrations::run_source_migrations;
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-utils"))]
 pub mod postgres;

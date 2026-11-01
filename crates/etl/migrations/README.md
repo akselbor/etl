@@ -5,7 +5,7 @@ two independent sets:
 
 | Directory | Owns | Applied by |
 | --- | --- | --- |
-| [`source/`](source/) | Source schema snapshots, DDL event triggers, and publication-aware schema-change messages. | `Pipeline::start` through `etl::postgres::migrations::run_source_migrations`, unless explicitly disabled. |
+| [`source/`](source/) | Source schema snapshots, DDL event triggers, and publication-aware schema-change messages. | `Pipeline::start` through `etl::run_source_migrations`, unless explicitly disabled. |
 | [`postgres_store/`](postgres_store/) | Durable replication progress, table state, stored schemas, and destination metadata. | `etl::store::PostgresStore::new`. |
 
 Every pipeline needs the source helpers, including pipelines using a custom state
@@ -68,6 +68,12 @@ change. Preserve matching `.up.sql`/`.down.sql` pairs and verify rollback compat
 where a down migration is supported.
 
 ## Applying and testing
+
+Embedded applications can call `etl::run_source_migrations(&admin_config)` during
+provisioning, then start their runtime pipeline with `run_source_migrations: false`.
+The administrator connection needs superuser privileges to create the DDL event
+trigger. See [Configure Postgres](../../../site/content/docs/guides/configure-postgres.mdx#replication-user)
+for runtime permissions. This entrypoint does not require the `test-utils` feature.
 
 `cargo x migrate` creates the configured local database if necessary, applies the
 Postgres store set, then the source set. `cargo x init` includes this step. The
